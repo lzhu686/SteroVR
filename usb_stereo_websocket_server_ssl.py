@@ -19,16 +19,16 @@ USB双目立体相机 WebSocket 服务器 (SSL/WSS 版本)
 │    python usb_stereo_websocket_server_ssl.py                │
 │                                                             │
 │  远程设备访问:                                               │
-│    1. 浏览器打开: https://你的IP:8445/StereoVision/RGB125/   │
+│    1. 浏览器打开: https://你的IP:8445/                       │
 │    2. 信任证书后访问 dual_infrared_vr_viewer.html            │
 │    3. WebSocket 自动连接 wss://你的IP:8765                   │
 └─────────────────────────────────────────────────────────────┘
 
 依赖安装: pip install opencv-python websockets numpy
 
-作者: lucas ZHU
-日期: 2025年8月13日
-更新: 支持 SSL/WSS 远程访问
+作者: Liang ZHU
+邮箱: lzhu686@connect.hkust-gz.edu.cn
+日期: 2025
 """
 
 import asyncio
@@ -539,7 +539,7 @@ class USBStereoWebSocketServerSSL:
         print(f"⚡ 目标帧率: {self.target_fps}fps")
         print("=" * 60)
         print("\n📱 其他设备访问方法:")
-        print(f"   1. 在目标设备浏览器打开: https://{local_ip}:8445/RGB125/")
+        print(f"   1. 在目标设备浏览器打开: https://{local_ip}:8445/")
         print(f"   2. 信任自签名证书")
         print(f"   3. 打开 dual_infrared_vr_viewer.html")
         print(f"   4. 页面会自动连接到 {protocol}://{local_ip}:{self.port}")

@@ -16,4 +16,6 @@ venv/
 # 系统文件
 .DS_Store
 Thumbs.db
-EOF
+
+# 日志
+*.log

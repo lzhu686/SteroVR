@@ -8,9 +8,12 @@
     python start_stereo_server.py
 
 其他设备访问:
-    1. 浏览器打开: https://你的IP:8445/RGB125/dual_infrared_vr_viewer.html
+    1. 浏览器打开: https://你的IP:8445/dual_infrared_vr_viewer.html
     2. 信任自签名证书
     3. 页面会自动连接 wss://你的IP:8765
+
+作者: Liang ZHU
+邮箱: lzhu686@connect.hkust-gz.edu.cn
 """
 
 import asyncio
@@ -37,20 +40,25 @@ def get_local_ip():
 def start_https_server(port=8445):
     """启动 HTTPS 文件服务器"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    stereo_vision_dir = os.path.dirname(script_dir)  # StereoVision 目录
-    project_root = os.path.dirname(stereo_vision_dir)  # 项目根目录
 
-    # 查找证书
-    cert_file = os.path.join(project_root, "webxr_cert.pem")
-    key_file = os.path.join(project_root, "webxr_key.pem")
+    # 查找证书 (当前目录)
+    cert_file = os.path.join(script_dir, "server.crt")
+    key_file = os.path.join(script_dir, "server.key")
 
     if not os.path.exists(cert_file) or not os.path.exists(key_file):
         print(f"❌ 找不到SSL证书: {cert_file}")
-        print("请先运行 start.py 或手动生成证书")
-        return
+        print("正在自动生成证书...")
+        import subprocess
+        cmd = [
+            'openssl', 'req', '-x509', '-newkey', 'rsa:4096',
+            '-keyout', key_file, '-out', cert_file,
+            '-days', '365', '-nodes',
+            '-subj', '/C=CN/ST=Guangdong/L=Guangzhou/O=HKUST-GZ/CN=localhost'
+        ]
+        subprocess.run(cmd, capture_output=True)
 
-    # 切换到 StereoVision 目录
-    os.chdir(stereo_vision_dir)
+    # 切换到当前目录
+    os.chdir(script_dir)
 
     # 创建SSL上下文
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -63,9 +71,9 @@ def start_https_server(port=8445):
     local_ip = get_local_ip()
 
     print(f"🌐 HTTPS文件服务器启动在端口 {port}")
-    print(f"📂 服务目录: {stereo_vision_dir}")
-    print(f"🔗 本地访问: https://localhost:{port}/RGB125/dual_infrared_vr_viewer.html")
-    print(f"🔗 局域网访问: https://{local_ip}:{port}/RGB125/dual_infrared_vr_viewer.html")
+    print(f"📂 服务目录: {script_dir}")
+    print(f"🔗 本地访问: https://localhost:{port}/dual_infrared_vr_viewer.html")
+    print(f"🔗 局域网访问: https://{local_ip}:{port}/dual_infrared_vr_viewer.html")
 
     server.serve_forever()
 
@@ -105,7 +113,7 @@ def main():
     print("📱 其他设备访问方法:")
     print("=" * 70)
     print(f"1. 在VR设备或手机浏览器打开:")
-    print(f"   https://{local_ip}:8445/RGB125/dual_infrared_vr_viewer.html")
+    print(f"   https://{local_ip}:8445/dual_infrared_vr_viewer.html")
     print()
     print(f"2. 浏览器会提示证书不安全，选择'继续前往'或'信任此证书'")
     print()
