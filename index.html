@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RealSense D435 双红外传感器系统</title>
+    <title>双目RGB相机 立体视觉系统</title>
     <style>
         * {
             margin: 0;
@@ -185,7 +185,7 @@
 <body>
     <div class="container">
         <div class="header">
-            <h1>🎥 RealSense D435 双红外传感器</h1>
+            <h1>🎥 双目RGB相机 立体视觉</h1>
             <p>高精度立体视觉系统</p>
             <div class="subtitle">选择您的查看模式</div>
         </div>
@@ -196,10 +196,10 @@
                 <div class="option-icon">🖥️</div>
                 <div class="option-title">2D 监视器查看</div>
                 <div class="option-description">
-                    在普通浏览器中查看左右红外传感器数据，适合调试和监控
+                    在普通浏览器中查看左右双目相机数据，适合调试和监控
                 </div>
                 <ul class="option-features">
-                    <li>实时双红外图像显示</li>
+                    <li>实时双目图像显示</li>
                     <li>性能统计和监控</li>
                     <li>图像保存功能</li>
                     <li>质量调整控制</li>
@@ -215,14 +215,14 @@
                 <div class="option-icon">🥽</div>
                 <div class="option-title">VR 立体视觉</div>
                 <div class="option-description">
-                    在Quest 3等VR头显中体验真正的立体深度感知
+                    在VR头显中体验真正的立体深度感知
                 </div>
                 <ul class="option-features">
-                    <li>左红外 → 左眼视觉</li>
-                    <li>右红外 → 右眼视觉</li>
+                    <li>左目 → 左眼视觉</li>
+                    <li>右目 → 右眼视觉</li>
                     <li>沉浸式立体体验</li>
                     <li>WebXR技术支持</li>
-                    <li>Quest 3 优化</li>
+                    <li>多VR设备支持</li>
                 </ul>
                 <a href="dual_infrared_vr_viewer.html" class="btn btn-secondary" onclick="event.stopPropagation()">
                     进入VR模式
@@ -243,18 +243,18 @@
                 </div>
                 <div class="info-item">
                     <div class="info-label">支持设备</div>
-                    <div class="info-value">RealSense D435</div>
+                    <div class="info-value">USB双目相机</div>
                 </div>
                 <div class="info-item">
                     <div class="info-label">VR支持</div>
-                    <div class="info-value">Quest 3, Quest 2</div>
+                    <div class="info-value">Quest, PICO, Vision Pro, HTC</div>
                 </div>
             </div>
             
             <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.2); font-size: 0.9em; opacity: 0.7;">
                 <p><strong>使用说明:</strong></p>
-                <p>• 确保RealSense D435设备已连接</p>
-                <p>• 启动WebSocket服务器处理传感器数据</p>
+                <p>• 确保USB双目相机设备已连接</p>
+                <p>• 启动WebSocket服务器处理相机数据</p>
                 <p>• VR模式需要支持WebXR的浏览器和VR头显</p>
                 <p>• 2D模式兼容所有现代浏览器</p>
             </div>
@@ -276,7 +276,7 @@
         }
 
         // 页面加载时的欢迎信息
-        console.log('🎥 RealSense D435 双红外传感器系统');
+        console.log('🎥 双目RGB相机 立体视觉系统');
         console.log('选择查看模式：');
         console.log('- 2D监视器查看：dual_infrared_viewer.html');
         console.log('- VR立体视觉：dual_infrared_vr_viewer.html');

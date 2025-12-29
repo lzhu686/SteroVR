@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quest 3 双红外传感器立体视觉</title>
+    <title>双目RGB相机 VR立体视觉</title>
     <script type="importmap">
     {
         "imports": {
@@ -99,13 +99,13 @@
 </head>
 <body>
     <div id="info">
-        <h2>🥽 Quest 3 双红外立体视觉</h2>
-        <p>RealSense D435 红外传感器 VR 立体显示</p>
+        <h2>🥽 双目RGB相机 VR立体视觉</h2>
+        <p>USB双目相机 VR 立体显示</p>
         <ul style="font-size: 12px;">
-            <li>左红外 → 左眼视觉</li>
-            <li>右红外 → 右眼视觉</li>
+            <li>左目 → 左眼视觉</li>
+            <li>右目 → 右眼视觉</li>
             <li>实时立体深度感知</li>
-            <li>WebXR Quest 3 优化</li>
+            <li>WebXR 多设备支持</li>
             <li>WebSocket实时传输</li>
         </ul>
         <p style="font-size: 11px; color: #aaa; margin-top: 10px;">
@@ -116,7 +116,7 @@
     <div id="status">
         <div>🔌 WebSocket: <span id="wsStatus" class="status-disconnected">未连接</span></div>
         <div>🥽 VR状态: <span id="vrStatus">未启动</span></div>
-        <div>📡 红外数据: <span id="irStatus">未接收</span></div>
+        <div>📡 图像数据: <span id="irStatus">未接收</span></div>
         <div>📊 帧率: <span id="dataRate">0 FPS</span></div>
         <div>🎯 延迟: <span id="latency">0ms</span></div>
         <div style="margin-top: 10px;">
@@ -129,11 +129,11 @@
     <!-- 非VR模式预览 -->
     <div id="preview-container">
         <div class="preview-eye">
-            <div class="eye-label">👁️ 左眼视图 (Left IR)</div>
+            <div class="eye-label">👁️ 左眼视图 (Left)</div>
             <canvas id="leftEyeCanvas"></canvas>
         </div>
         <div class="preview-eye">
-            <div class="eye-label">👁️ 右眼视图 (Right IR)</div>
+            <div class="eye-label">👁️ 右眼视图 (Right)</div>
             <canvas id="rightEyeCanvas"></canvas>
         </div>
     </div>
@@ -145,8 +145,8 @@
         import { VRButton } from 'three/addons/webxr/VRButton.js';
         
         /**
-         * Quest 3 双红外传感器立体视觉显示器
-         * 将RealSense D435的左右红外传感器图像分别显示到VR头显的左右眼
+         * 双目RGB相机 VR立体视觉显示器
+         * 将USB双目相机的左右图像分别显示到VR头显的左右眼
          * 实现真正的立体深度感知体验
          */
         class Quest3StereoIRViewer {
@@ -363,8 +363,8 @@
                     this.connectWebSocket();
                     this.setupEventHandlers();
                     
-                    this.log('INFO', 'Quest 3 双红外立体视觉初始化完成');
-                    this.sendLogToServer('INFO', 'Quest 3 双红外立体视觉初始化完成');
+                    this.log('INFO', '双目RGB相机 VR立体视觉初始化完成');
+                    this.sendLogToServer('INFO', '双目RGB相机 VR立体视觉初始化完成');
                 } catch (error) {
                     this.log('ERROR', '初始化失败', error);
                     this.sendLogToServer('ERROR', `初始化失败: ${error.message}`);
@@ -400,7 +400,7 @@
                     ctx.fillStyle = '#4CAF50';
                     ctx.font = '20px Arial';
                     ctx.textAlign = 'center';
-                    ctx.fillText('等待125°FOV红外数据...', canvas.width/2, canvas.height/2 - 20);
+                    ctx.fillText('等待125°FOV图像数据...', canvas.width/2, canvas.height/2 - 20);
                     ctx.fillText(`基线距离: ${this.cameraSpecs.baseline * 1000}mm`, canvas.width/2, canvas.height/2 + 20);
                     
                     return new THREE.CanvasTexture(canvas);
@@ -621,7 +621,7 @@
                 const { left_infrared, right_infrared, timestamp, metadata } = data;
 
                 if (!left_infrared || !right_infrared) {
-                    console.warn('❌ 缺少红外数据');
+                    console.warn('❌ 缺少图像数据');
                     return;
                 }
 
@@ -940,7 +940,7 @@
         }
         
         // 启动应用
-        console.log('启动Quest 3 双红外传感器立体视觉显示器');
+        console.log('启动双目RGB相机 VR立体视觉显示器');
         try {
             const viewer = new Quest3StereoIRViewer();
             window.vrViewer = viewer; // 便于调试

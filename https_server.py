@@ -34,7 +34,7 @@ class SimpleHTTPSServer:
                 'openssl', 'req', '-x509', '-newkey', 'rsa:2048',
                 '-keyout', self.key_file, '-out', self.cert_file,
                 '-days', '365', '-nodes',
-                '-subj', '/C=CN/ST=Beijing/L=Beijing/O=RealSense/CN=localhost'
+                '-subj', '/C=CN/ST=Guangdong/L=Guangzhou/O=StereoVision/CN=localhost'
             ]
             
             result = subprocess.run(cmd, capture_output=True, text=True)
@@ -91,7 +91,7 @@ class SimpleHTTPSServer:
             print(f"📁 服务目录: {self.directory}")
             print(f"🔗 本地访问: {protocol}://localhost:{self.port}")
             print(f"🔗 网络访问: {protocol}://{local_ip}:{self.port}")
-            print(f"🎥 双红外页面: {protocol}://localhost:{self.port}/dual_infrared_viewer.html")
+            print(f"🎥 双目相机页面: {protocol}://localhost:{self.port}/dual_infrared_viewer.html")
             print(f"🥽 VR立体视觉: {protocol}://localhost:{self.port}/dual_infrared_vr_viewer.html")
             print("🔥 按 Ctrl+C 停止服务器")
             print("=" * 60)
@@ -123,7 +123,7 @@ class SimpleHTTPSServer:
 
 def main():
     """主函数"""
-    print("🌐 启动RealSense双红外传感器HTTPS服务器")
+    print("🌐 启动双目RGB相机 HTTPS服务器")
     print("=" * 50)
     
     # 检查HTML文件是否存在

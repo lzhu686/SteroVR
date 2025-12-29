@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RealSense D435 双红外传感器实时显示</title>
+    <title>双目RGB相机 实时显示</title>
     <style>
         * {
             margin: 0;
@@ -342,8 +342,8 @@
     <div class="connection-status" id="connectionStatus">断开连接</div>
     
     <div class="header">
-        <h1>🎥 RealSense D435 双红外传感器</h1>
-        <p>实时立体视觉 • 左右红外传感器黑白图像显示</p>
+        <h1>🎥 双目RGB相机</h1>
+        <p>实时立体视觉 • 左右双目图像显示</p>
     </div>
 
     <div class="container">
@@ -402,14 +402,14 @@
 
         <!-- 视频显示区域 -->
         <div class="video-container">
-            <!-- 左红外传感器 -->
+            <!-- 左相机 -->
             <div class="video-panel">
-                <h3>🎯 左红外传感器 (Left IR)</h3>
+                <h3>🎯 左相机 (Left)</h3>
                 <div class="video-wrapper">
                     <div class="placeholder" id="leftPlaceholder">
-                        等待左红外传感器数据...
+                        等待左相机数据...
                     </div>
-                    <img class="video-frame" id="leftIRFrame" style="display: none;" alt="左红外传感器">
+                    <img class="video-frame" id="leftIRFrame" style="display: none;" alt="左相机">
                     <div class="fps-indicator" id="leftFPS">0 FPS</div>
                     <div class="metadata-panel" id="leftMetadata">
                         位置: 相机左侧 • 用途: 立体视觉左视图
@@ -417,14 +417,14 @@
                 </div>
             </div>
 
-            <!-- 右红外传感器 -->
+            <!-- 右相机 -->
             <div class="video-panel">
-                <h3>🎯 右红外传感器 (Right IR)</h3>
+                <h3>🎯 右相机 (Right)</h3>
                 <div class="video-wrapper">
                     <div class="placeholder" id="rightPlaceholder">
-                        等待右红外传感器数据...
+                        等待右相机数据...
                     </div>
-                    <img class="video-frame" id="rightIRFrame" style="display: none;" alt="右红外传感器">
+                    <img class="video-frame" id="rightIRFrame" style="display: none;" alt="右相机">
                     <div class="fps-indicator" id="rightFPS">0 FPS</div>
                     <div class="metadata-panel" id="rightMetadata">
                         位置: 相机右侧 • 用途: 立体视觉右视图
@@ -494,7 +494,7 @@
         function connectWebSocket() {
             if (isConnected) return;
 
-            addLog('正在连接到RealSense传感器...', 'info');
+            addLog('正在连接到双目相机...', 'info');
             updateConnectionStatus('connecting');
             
             try {
@@ -652,8 +652,8 @@
             elements.leftPlaceholder.style.display = 'flex';
             elements.rightPlaceholder.style.display = 'flex';
             
-            elements.leftPlaceholder.textContent = '等待左红外传感器数据...';
-            elements.rightPlaceholder.textContent = '等待右红外传感器数据...';
+            elements.leftPlaceholder.textContent = '等待左相机数据...';
+            elements.rightPlaceholder.textContent = '等待右相机数据...';
         }
 
         // 更新连接状态
@@ -718,10 +718,10 @@
             if (leftFrame.src && rightFrame.src) {
                 const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
                 
-                // 下载左红外图像
+                // 下载左图像
                 downloadImage(leftFrame.src, `left_infrared_${timestamp}.jpg`);
                 
-                // 下载右红外图像
+                // 下载右图像
                 downloadImage(rightFrame.src, `right_infrared_${timestamp}.jpg`);
                 
                 addLog(`💾 已保存图像: ${timestamp}`, 'success');
