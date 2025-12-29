@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RealSense D435 双红外传感器实时显示</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Arial', sans-serif;
+            background: linear-gradient(135deg, #1e3c72, #2a5298);
+            color: white;
+            overflow-x: hidden;
+        }
+
+        .header {
+            text-align: center;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.3);
+            backdrop-filter: blur(10px);
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+        }
+
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 25px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(45deg, #28a745, #20c997);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 15px rgba(40, 167, 69, 0.3);
+        }
+
+        .btn-secondary {
+            background: linear-gradient(45deg, #6c757d, #868e96);
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 15px rgba(108, 117, 125, 0.3);
+        }
+
+        .btn-danger {
+            background: linear-gradient(45deg, #dc3545, #e74c3c);
+            color: white;
+        }
+
+        .btn-danger:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 15px rgba(220, 53, 69, 0.3);
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none !important;
+            box-shadow: none !important;
+        }
+
+        .status-panel {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 30px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            text-align: center;
+        }
+
+        .status-item {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 15px;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .status-label {
+            font-size: 0.9em;
+            opacity: 0.8;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .status-value {
+            font-size: 1.5em;
+            font-weight: bold;
+            color: #28a745;
+        }
+
+        .video-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .video-panel {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            transition: all 0.3s ease;
+        }
+
+        .video-panel:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+        }
+
+        .video-panel h3 {
+            text-align: center;
+            margin-bottom: 15px;
+            font-size: 1.3em;
+            color: #fff;
+            text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.5);
+        }
+
+        .video-frame {
+            width: 100%;
+            height: auto;
+            border-radius: 10px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            transition: all 0.3s ease;
+            background: #000;
+            min-height: 300px;
+            object-fit: cover;
+        }
+
+        .video-frame:hover {
+            border-color: #28a745;
+            box-shadow: 0 0 20px rgba(40, 167, 69, 0.3);
+        }
+
+        .placeholder {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 300px;
+            background: linear-gradient(45deg, #333, #555);
+            color: #ccc;
+            font-size: 1.2em;
+            border-radius: 10px;
+            border: 2px dashed rgba(255, 255, 255, 0.3);
+        }
+
+        .connection-status {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 10px 20px;
+            border-radius: 25px;
+            font-weight: bold;
+            z-index: 1000;
+            transition: all 0.3s ease;
+        }
+
+        .status-connected {
+            background: linear-gradient(45deg, #28a745, #20c997);
+            color: white;
+        }
+
+        .status-disconnected {
+            background: linear-gradient(45deg, #dc3545, #e74c3c);
+            color: white;
+        }
+
+        .status-connecting {
+            background: linear-gradient(45deg, #ffc107, #fd7e14);
+            color: white;
+        }
+
+        .logs-panel {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 15px;
+            padding: 20px;
+            margin-top: 30px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .logs-panel h3 {
+            margin-bottom: 15px;
+            color: #fff;
+        }
+
+        .log-entry {
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            margin-bottom: 5px;
+            padding: 5px 10px;
+            border-radius: 5px;
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .log-info { color: #17a2b8; }
+        .log-warning { color: #ffc107; }
+        .log-error { color: #dc3545; }
+        .log-success { color: #28a745; }
+
+        .quality-control {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-top: 15px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .quality-control label {
+            font-weight: bold;
+        }
+
+        .quality-control input[type="range"] {
+            width: 200px;
+            height: 5px;
+            border-radius: 5px;
+            background: rgba(255, 255, 255, 0.3);
+            outline: none;
+        }
+
+        .quality-control input[type="range"]::-webkit-slider-thumb {
+            appearance: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #28a745;
+            cursor: pointer;
+            border: 2px solid #fff;
+        }
+
+        @media (max-width: 768px) {
+            .video-container {
+                grid-template-columns: 1fr;
+            }
+            
+            .status-grid {
+                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            }
+            
+            .controls {
+                flex-direction: column;
+                align-items: center;
+            }
+            
+            .btn {
+                width: 200px;
+            }
+        }
+
+        .fps-indicator {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #28a745;
+            padding: 5px 10px;
+            border-radius: 15px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            font-weight: bold;
+        }
+
+        .metadata-panel {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 10px;
+            border-radius: 10px;
+            font-size: 0.8em;
+            font-family: 'Courier New', monospace;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .video-panel:hover .metadata-panel {
+            opacity: 1;
+        }
+
+        .video-wrapper {
+            position: relative;
+            overflow: hidden;
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="connection-status" id="connectionStatus">断开连接</div>
+    
+    <div class="header">
+        <h1>🎥 RealSense D435 双红外传感器</h1>
+        <p>实时立体视觉 • 左右红外传感器黑白图像显示</p>
+    </div>
+
+    <div class="container">
+        <!-- 控制面板 -->
+        <div class="controls">
+            <button class="btn btn-primary" id="connectBtn" onclick="connectWebSocket()">
+                🔌 连接传感器
+            </button>
+            <button class="btn btn-secondary" id="disconnectBtn" onclick="disconnectWebSocket()" disabled>
+                🔌 断开连接
+            </button>
+            <button class="btn btn-secondary" id="saveBtn" onclick="saveCurrentFrames()" disabled>
+                💾 保存图像
+            </button>
+            <button class="btn btn-danger" id="clearLogsBtn" onclick="clearLogs()">
+                🗑️ 清空日志
+            </button>
+        </div>
+
+        <!-- 状态面板 -->
+        <div class="status-panel">
+            <div class="status-grid">
+                <div class="status-item">
+                    <div class="status-label">连接状态</div>
+                    <div class="status-value" id="statusValue">离线</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">实际帧率</div>
+                    <div class="status-value" id="fpsValue">0 FPS</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">总帧数</div>
+                    <div class="status-value" id="frameCountValue">0</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">压缩率</div>
+                    <div class="status-value" id="compressionValue">0%</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">分辨率</div>
+                    <div class="status-value" id="resolutionValue">0x0</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">延迟</div>
+                    <div class="status-value" id="latencyValue">0ms</div>
+                </div>
+            </div>
+            
+            <!-- 质量控制 -->
+            <div class="quality-control">
+                <label for="qualitySlider">图像质量:</label>
+                <input type="range" id="qualitySlider" min="30" max="95" value="80" oninput="updateQuality()">
+                <span id="qualityValue">80%</span>
+            </div>
+        </div>
+
+        <!-- 视频显示区域 -->
+        <div class="video-container">
+            <!-- 左红外传感器 -->
+            <div class="video-panel">
+                <h3>🎯 左红外传感器 (Left IR)</h3>
+                <div class="video-wrapper">
+                    <div class="placeholder" id="leftPlaceholder">
+                        等待左红外传感器数据...
+                    </div>
+                    <img class="video-frame" id="leftIRFrame" style="display: none;" alt="左红外传感器">
+                    <div class="fps-indicator" id="leftFPS">0 FPS</div>
+                    <div class="metadata-panel" id="leftMetadata">
+                        位置: 相机左侧 • 用途: 立体视觉左视图
+                    </div>
+                </div>
+            </div>
+
+            <!-- 右红外传感器 -->
+            <div class="video-panel">
+                <h3>🎯 右红外传感器 (Right IR)</h3>
+                <div class="video-wrapper">
+                    <div class="placeholder" id="rightPlaceholder">
+                        等待右红外传感器数据...
+                    </div>
+                    <img class="video-frame" id="rightIRFrame" style="display: none;" alt="右红外传感器">
+                    <div class="fps-indicator" id="rightFPS">0 FPS</div>
+                    <div class="metadata-panel" id="rightMetadata">
+                        位置: 相机右侧 • 用途: 立体视觉右视图
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 日志面板 -->
+        <div class="logs-panel">
+            <h3>📝 系统日志</h3>
+            <div id="logsContainer"></div>
+        </div>
+    </div>
+
+    <script>
+        // WebSocket连接管理
+        let websocket = null;
+        let isConnected = false;
+        let reconnectAttempts = 0;
+        let maxReconnectAttempts = 5;
+        let frameCount = 0;
+        let startTime = Date.now();
+        let lastFrameTime = 0;
+
+        // 性能统计
+        let stats = {
+            totalFrames: 0,
+            totalBytes: 0,
+            lastFPSUpdate: Date.now(),
+            framesSinceLastUpdate: 0
+        };
+
+        // WebSocket服务器配置
+        const WS_HOST = window.location.hostname || 'localhost';
+        const WS_PORT = 8765;
+        // 使用安全的WebSocket连接 (wss://) 当页面通过HTTPS加载时
+        const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const WS_URL = `${WS_PROTOCOL}//${WS_HOST}:${WS_PORT}`;
+
+        // UI元素
+        const elements = {
+            connectionStatus: document.getElementById('connectionStatus'),
+            connectBtn: document.getElementById('connectBtn'),
+            disconnectBtn: document.getElementById('disconnectBtn'),
+            saveBtn: document.getElementById('saveBtn'),
+            statusValue: document.getElementById('statusValue'),
+            fpsValue: document.getElementById('fpsValue'),
+            frameCountValue: document.getElementById('frameCountValue'),
+            compressionValue: document.getElementById('compressionValue'),
+            resolutionValue: document.getElementById('resolutionValue'),
+            latencyValue: document.getElementById('latencyValue'),
+            leftIRFrame: document.getElementById('leftIRFrame'),
+            rightIRFrame: document.getElementById('rightIRFrame'),
+            leftPlaceholder: document.getElementById('leftPlaceholder'),
+            rightPlaceholder: document.getElementById('rightPlaceholder'),
+            leftFPS: document.getElementById('leftFPS'),
+            rightFPS: document.getElementById('rightFPS'),
+            leftMetadata: document.getElementById('leftMetadata'),
+            rightMetadata: document.getElementById('rightMetadata'),
+            logsContainer: document.getElementById('logsContainer'),
+            qualitySlider: document.getElementById('qualitySlider'),
+            qualityValue: document.getElementById('qualityValue')
+        };
+
+        // 连接WebSocket
+        function connectWebSocket() {
+            if (isConnected) return;
+
+            addLog('正在连接到RealSense传感器...', 'info');
+            updateConnectionStatus('connecting');
+            
+            try {
+                websocket = new WebSocket(WS_URL);
+                
+                websocket.onopen = function(event) {
+                    isConnected = true;
+                    reconnectAttempts = 0;
+                    updateConnectionStatus('connected');
+                    updateButtons();
+                    addLog('✅ WebSocket连接已建立', 'success');
+                    startTime = Date.now();
+                };
+                
+                websocket.onmessage = function(event) {
+                    try {
+                        const data = JSON.parse(event.data);
+                        handleWebSocketMessage(data);
+                    } catch (error) {
+                        addLog(`❌ 解析消息失败: ${error.message}`, 'error');
+                    }
+                };
+                
+                websocket.onclose = function(event) {
+                    isConnected = false;
+                    updateConnectionStatus('disconnected');
+                    updateButtons();
+                    hideFrames();
+                    
+                    if (event.wasClean) {
+                        addLog('🔌 WebSocket连接已正常关闭', 'info');
+                    } else {
+                        addLog(`❌ WebSocket连接异常断开 (code: ${event.code})`, 'error');
+                        attemptReconnect();
+                    }
+                };
+                
+                websocket.onerror = function(error) {
+                    addLog(`❌ WebSocket错误: ${error}`, 'error');
+                };
+                
+            } catch (error) {
+                addLog(`❌ 连接失败: ${error.message}`, 'error');
+                updateConnectionStatus('disconnected');
+            }
+        }
+
+        // 断开WebSocket连接
+        function disconnectWebSocket() {
+            if (websocket && isConnected) {
+                websocket.close(1000, 'User initiated disconnect');
+                addLog('🔌 用户断开连接', 'info');
+            }
+        }
+
+        // 处理WebSocket消息
+        function handleWebSocketMessage(data) {
+            switch (data.type) {
+                case 'connection_established':
+                    handleConnectionEstablished(data);
+                    break;
+                case 'dual_infrared_frame':
+                    handleDualInfraredFrame(data);
+                    break;
+                default:
+                    addLog(`❓ 未知消息类型: ${data.type}`, 'warning');
+            }
+        }
+
+        // 处理连接建立消息
+        function handleConnectionEstablished(data) {
+            const { camera_info, server_info } = data;
+            addLog(`🎥 相机信息: ${camera_info.width}x${camera_info.height} @${camera_info.fps}fps`, 'success');
+            addLog(`🖥️ 服务器版本: ${server_info.version}`, 'info');
+            
+            // 更新分辨率显示
+            elements.resolutionValue.textContent = `${camera_info.width}x${camera_info.height}`;
+        }
+
+        // 处理双红外帧数据
+        function handleDualInfraredFrame(data) {
+            const { left_infrared, right_infrared, metadata, stats, timestamp } = data;
+            
+            // 更新图像
+            if (left_infrared && right_infrared) {
+                updateInfraredFrame('left', left_infrared, metadata);
+                updateInfraredFrame('right', right_infrared, metadata);
+                
+                frameCount++;
+                stats.totalFrames++;
+                
+                // 计算延迟
+                const currentTime = Date.now();
+                const latency = currentTime - (timestamp * 1000);
+                elements.latencyValue.textContent = `${Math.round(latency)}ms`;
+                
+                // 更新统计信息
+                updateStats(stats, metadata);
+                updateFrameRate();
+            }
+        }
+
+        // 更新红外图像
+        function updateInfraredFrame(side, base64Data, metadata) {
+            const frameElement = elements[`${side}IRFrame`];
+            const placeholderElement = elements[`${side}Placeholder`];
+            const fpsElement = elements[`${side}FPS`];
+            const metadataElement = elements[`${side}Metadata`];
+            
+            // 显示图像
+            frameElement.src = `data:image/jpeg;base64,${base64Data}`;
+            frameElement.style.display = 'block';
+            placeholderElement.style.display = 'none';
+            
+            // 更新元数据
+            if (metadata) {
+                const sideText = side === 'left' ? '左侧' : '右侧';
+                metadataElement.innerHTML = `
+                    位置: 相机${sideText} • 分辨率: ${metadata.width}x${metadata.height}<br>
+                    质量: ${metadata.quality}% • 压缩率: ${(metadata.compression_ratio * 100).toFixed(1)}%<br>
+                    大小: ${(metadata.compressed_size / 1024).toFixed(1)} KB
+                `;
+            }
+        }
+
+        // 更新统计信息
+        function updateStats(serverStats, metadata) {
+            elements.frameCountValue.textContent = serverStats.frames_captured || frameCount;
+            elements.fpsValue.textContent = `${serverStats.fps_actual || 0} FPS`;
+            
+            if (metadata && metadata.compression_ratio) {
+                elements.compressionValue.textContent = `${(metadata.compression_ratio * 100).toFixed(1)}%`;
+            }
+        }
+
+        // 更新帧率显示
+        function updateFrameRate() {
+            const currentTime = Date.now();
+            stats.framesSinceLastUpdate++;
+            
+            if (currentTime - stats.lastFPSUpdate >= 1000) {
+                const fps = stats.framesSinceLastUpdate;
+                elements.leftFPS.textContent = `${fps} FPS`;
+                elements.rightFPS.textContent = `${fps} FPS`;
+                
+                stats.framesSinceLastUpdate = 0;
+                stats.lastFPSUpdate = currentTime;
+            }
+        }
+
+        // 隐藏图像帧
+        function hideFrames() {
+            elements.leftIRFrame.style.display = 'none';
+            elements.rightIRFrame.style.display = 'none';
+            elements.leftPlaceholder.style.display = 'flex';
+            elements.rightPlaceholder.style.display = 'flex';
+            
+            elements.leftPlaceholder.textContent = '等待左红外传感器数据...';
+            elements.rightPlaceholder.textContent = '等待右红外传感器数据...';
+        }
+
+        // 更新连接状态
+        function updateConnectionStatus(status) {
+            const statusElement = elements.connectionStatus;
+            const statusValue = elements.statusValue;
+            
+            switch (status) {
+                case 'connected':
+                    statusElement.textContent = '已连接';
+                    statusElement.className = 'connection-status status-connected';
+                    statusValue.textContent = '在线';
+                    statusValue.style.color = '#28a745';
+                    break;
+                case 'disconnected':
+                    statusElement.textContent = '断开连接';
+                    statusElement.className = 'connection-status status-disconnected';
+                    statusValue.textContent = '离线';
+                    statusValue.style.color = '#dc3545';
+                    break;
+                case 'connecting':
+                    statusElement.textContent = '连接中...';
+                    statusElement.className = 'connection-status status-connecting';
+                    statusValue.textContent = '连接中';
+                    statusValue.style.color = '#ffc107';
+                    break;
+            }
+        }
+
+        // 更新按钮状态
+        function updateButtons() {
+            elements.connectBtn.disabled = isConnected;
+            elements.disconnectBtn.disabled = !isConnected;
+            elements.saveBtn.disabled = !isConnected;
+        }
+
+        // 尝试重连
+        function attemptReconnect() {
+            if (reconnectAttempts < maxReconnectAttempts) {
+                reconnectAttempts++;
+                const delay = Math.pow(2, reconnectAttempts) * 1000; // 指数退避
+                
+                addLog(`🔄 ${delay/1000}秒后尝试重连 (${reconnectAttempts}/${maxReconnectAttempts})`, 'warning');
+                
+                setTimeout(() => {
+                    if (!isConnected) {
+                        connectWebSocket();
+                    }
+                }, delay);
+            } else {
+                addLog('❌ 达到最大重连次数，请手动重连', 'error');
+            }
+        }
+
+        // 保存当前帧
+        function saveCurrentFrames() {
+            if (!isConnected) return;
+            
+            const leftFrame = elements.leftIRFrame;
+            const rightFrame = elements.rightIRFrame;
+            
+            if (leftFrame.src && rightFrame.src) {
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                
+                // 下载左红外图像
+                downloadImage(leftFrame.src, `left_infrared_${timestamp}.jpg`);
+                
+                // 下载右红外图像
+                downloadImage(rightFrame.src, `right_infrared_${timestamp}.jpg`);
+                
+                addLog(`💾 已保存图像: ${timestamp}`, 'success');
+            } else {
+                addLog('❌ 没有可保存的图像', 'warning');
+            }
+        }
+
+        // 下载图像
+        function downloadImage(dataURL, filename) {
+            const link = document.createElement('a');
+            link.href = dataURL;
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        // 更新图像质量
+        function updateQuality() {
+            const quality = elements.qualitySlider.value;
+            elements.qualityValue.textContent = `${quality}%`;
+            
+            // 这里可以发送质量调整命令到服务器
+            if (websocket && isConnected) {
+                const message = {
+                    type: 'quality_adjustment',
+                    quality: parseInt(quality)
+                };
+                websocket.send(JSON.stringify(message));
+                addLog(`🎨 图像质量调整为: ${quality}%`, 'info');
+            }
+        }
+
+        // 添加日志
+        function addLog(message, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            const logEntry = document.createElement('div');
+            logEntry.className = `log-entry log-${type}`;
+            logEntry.textContent = `[${timestamp}] ${message}`;
+            
+            elements.logsContainer.appendChild(logEntry);
+            elements.logsContainer.scrollTop = elements.logsContainer.scrollHeight;
+            
+            // 限制日志数量
+            while (elements.logsContainer.children.length > 100) {
+                elements.logsContainer.removeChild(elements.logsContainer.firstChild);
+            }
+        }
+
+        // 清空日志
+        function clearLogs() {
+            elements.logsContainer.innerHTML = '';
+            addLog('📝 日志已清空', 'info');
+        }
+
+        // 页面加载完成后初始化
+        document.addEventListener('DOMContentLoaded', function() {
+            addLog('🌐 页面加载完成，准备连接传感器', 'info');
+            updateButtons();
+            
+            // 自动连接（可选）
+            // connectWebSocket();
+        });
+
+        // 页面卸载时清理连接
+        window.addEventListener('beforeunload', function() {
+            if (websocket && isConnected) {
+                websocket.close();
+            }
+        });
+    </script>
+</body>
+</html>

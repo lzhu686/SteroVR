@@ -1,0 +1,973 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quest 3 双红外传感器立体视觉</title>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.178.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.178.0/examples/jsm/"
+        }
+    }
+    </script>
+    <style>
+        body {
+            margin: 0;
+            font-family: 'Arial', sans-serif;
+            background: #000;
+            color: white;
+            overflow: hidden;
+        }
+        
+        #info {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 100;
+            background: rgba(0,0,0,0.8);
+            padding: 20px;
+            border-radius: 10px;
+            max-width: 350px;
+            backdrop-filter: blur(10px);
+        }
+        
+        #status {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            z-index: 100;
+            background: rgba(0,0,0,0.8);
+            padding: 15px;
+            border-radius: 10px;
+            font-size: 14px;
+            backdrop-filter: blur(10px);
+        }
+        
+        .status-connected { color: #4CAF50; font-weight: bold; }
+        .status-disconnected { color: #f44336; font-weight: bold; }
+        
+        #vrButton {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            z-index: 100;
+        }
+
+        /* 非VR模式下的预览 */
+        #preview-container {
+            display: flex;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        .preview-eye {
+            flex: 1;
+            position: relative;
+            background: #111;
+            border: 2px solid #333;
+        }
+
+        .preview-eye canvas {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .eye-label {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.7);
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            z-index: 10;
+        }
+
+        /* VR模式隐藏预览 */
+        body.vr-mode #preview-container {
+            display: none;
+        }
+        
+        body.vr-mode #info,
+        body.vr-mode #status {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h2>🥽 Quest 3 双红外立体视觉</h2>
+        <p>RealSense D435 红外传感器 VR 立体显示</p>
+        <ul style="font-size: 12px;">
+            <li>左红外 → 左眼视觉</li>
+            <li>右红外 → 右眼视觉</li>
+            <li>实时立体深度感知</li>
+            <li>WebXR Quest 3 优化</li>
+            <li>WebSocket实时传输</li>
+        </ul>
+        <p style="font-size: 11px; color: #aaa; margin-top: 10px;">
+            点击"进入VR"按钮开始立体视觉体验
+        </p>
+    </div>
+    
+    <div id="status">
+        <div>🔌 WebSocket: <span id="wsStatus" class="status-disconnected">未连接</span></div>
+        <div>🥽 VR状态: <span id="vrStatus">未启动</span></div>
+        <div>📡 红外数据: <span id="irStatus">未接收</span></div>
+        <div>📊 帧率: <span id="dataRate">0 FPS</span></div>
+        <div>🎯 延迟: <span id="latency">0ms</span></div>
+        <div style="margin-top: 10px;">
+            <a href="/trust_cert.html" style="color: #4CAF50; text-decoration: none; font-size: 12px;">
+                🔐 SSL证书设置
+            </a>
+        </div>
+    </div>
+
+    <!-- 非VR模式预览 -->
+    <div id="preview-container">
+        <div class="preview-eye">
+            <div class="eye-label">👁️ 左眼视图 (Left IR)</div>
+            <canvas id="leftEyeCanvas"></canvas>
+        </div>
+        <div class="preview-eye">
+            <div class="eye-label">👁️ 右眼视图 (Right IR)</div>
+            <canvas id="rightEyeCanvas"></canvas>
+        </div>
+    </div>
+    
+    <div id="vrButton"></div>
+    
+    <script type="module">
+        import * as THREE from 'three';
+        import { VRButton } from 'three/addons/webxr/VRButton.js';
+        
+        /**
+         * Quest 3 双红外传感器立体视觉显示器
+         * 将RealSense D435的左右红外传感器图像分别显示到VR头显的左右眼
+         * 实现真正的立体深度感知体验
+         */
+        class Quest3StereoIRViewer {
+            constructor() {
+                // 3D场景基础设置
+                this.scene = new THREE.Scene();
+                this.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+                this.renderer = new THREE.WebGLRenderer({ antialias: true });
+                
+                // WebSocket连接
+                this.websocket = null;
+                this.isConnected = false;
+                
+                // VR状态
+                this.isVRActive = false;
+                
+                // 调试计数器
+                this.debugFrameCount = 0;
+                
+                // ⭐️ 双目相机参数 (125° DFOV, 60mm基线)
+                this.cameraSpecs = {
+                    diagonalFOV: 125,        // 对角线视场角（度）
+                    aspectRatio: 16 / 9,     // 宽高比
+                    baseline: 0.0,           // ⭐️ 设置为0，使左右眼画面在同一位置显示(like look 3d movie)
+                    imageWidth: 3840,        // 图像宽度 (已更新为3840x1080模式的单眼分辨率)
+                    imageHeight: 1080        // 图像高度 (已更新为3840x1080模式的单眼分辨率)
+                };
+                
+                // 计算的VR显示参数
+                this.vrDisplayParams = this.calculateVRDisplayParams();
+                
+                // 图像纹理和材质
+                this.leftIRTexture = null;
+                this.rightIRTexture = null;
+                this.leftEyeMaterial = null;
+                this.rightEyeMaterial = null;
+                
+                // 立体显示平面
+                this.vrLeftPlane = null;
+                this.vrRightPlane = null;
+
+                // ⭐️ 1. 定义渲染层
+                this.LEFT_EYE_LAYER = 1;
+                this.RIGHT_EYE_LAYER = 2;
+                
+                // 非VR预览画布
+                this.leftEyeCanvas = document.getElementById('leftEyeCanvas');
+                this.rightEyeCanvas = document.getElementById('rightEyeCanvas');
+                this.leftEyeCtx = this.leftEyeCanvas.getContext('2d');
+                this.rightEyeCtx = this.rightEyeCanvas.getContext('2d');
+                
+                // 数据统计
+                this.frameCount = 0;
+                this.lastUpdateTime = Date.now();
+                this.latencySum = 0;
+                this.latencyCount = 0;
+                
+                // 缓存图像数据
+                this.lastLeftIRData = null;
+                this.lastRightIRData = null;
+                
+                // 日志系统
+                this.logBuffer = [];
+                this.maxLogEntries = 1000;
+                this.setupLogging();
+                
+                this.init();
+            }
+            
+            /**
+             * 计算VR显示参数 - 修复：使用适中的屏幕尺寸避免模糊
+             */
+            calculateVRDisplayParams() {
+                const specs = this.cameraSpecs;
+                
+                // ⭐️ 修复方案：不追求完全匹配125°FOV，而是使用舒适的VR显示尺寸
+                // 1. 使用较小的显示距离和合理的屏幕尺寸
+                const displayDistance = 1;  // 减少到1米
+                
+                // 2. 使用适中的屏幕尺寸，确保良好的像素密度
+                const screenWidth = 1.6;    // 1.6米宽 (适中尺寸)
+                const screenHeight = 0.9;   // 0.9米高 (保持16:9比例)
+                
+                // 3. 从屏幕尺寸反推FOV (用于调试显示)
+                const vfovRad = 2 * Math.atan(screenHeight / (2 * displayDistance));
+                const vfovDeg = vfovRad * 180 / Math.PI;
+                
+                // 4. 基线偏移设为0（让WebXR处理立体效果）
+                const eyeOffset = 0;  // VR模式下不需要手动偏移
+                
+                const params = {
+                    vfovDeg,
+                    vfovRad,
+                    displayDistance,
+                    screenWidth,
+                    screenHeight,
+                    eyeOffset
+                };
+                
+                console.log('📐 VR显示参数优化完成:', {
+                    'effective_vfov': `${vfovDeg.toFixed(1)}°`,
+                    'screen_size': `${screenWidth}m × ${screenHeight}m`,
+                    'display_distance': `${displayDistance}m`,
+                    'pixel_density': '优化后应该更清晰',
+                    'eye_offset': `${eyeOffset}mm (无偏移)`
+                });
+                
+                return params;
+            }
+            
+            setupLogging() {
+                // 创建日志显示区域
+                const logContainer = document.createElement('div');
+                logContainer.id = 'logContainer';
+                logContainer.style.cssText = `
+                    position: fixed;
+                    bottom: 20px;
+                    left: 20px;
+                    width: 400px;
+                    height: 200px;
+                    background: rgba(0,0,0,0.9);
+                    color: #00ff00;
+                    font-family: 'Courier New', monospace;
+                    font-size: 10px;
+                    padding: 10px;
+                    border-radius: 5px;
+                    overflow-y: auto;
+                    z-index: 200;
+                    border: 1px solid #333;
+                    display: none;
+                `;
+                document.body.appendChild(logContainer);
+                
+                // 创建日志切换按钮
+                const logToggle = document.createElement('button');
+                logToggle.textContent = '📋 日志';
+                logToggle.style.cssText = `
+                    position: fixed;
+                    bottom: 230px;
+                    left: 20px;
+                    padding: 5px 10px;
+                    background: rgba(0,0,0,0.8);
+                    color: white;
+                    border: 1px solid #333;
+                    border-radius: 3px;
+                    cursor: pointer;
+                    z-index: 201;
+                    font-size: 12px;
+                `;
+                logToggle.onclick = () => {
+                    const container = document.getElementById('logContainer');
+                    container.style.display = container.style.display === 'none' ? 'block' : 'none';
+                };
+                document.body.appendChild(logToggle);
+                
+                this.log('INFO', 'VR立体视觉系统日志系统已启动');
+            }
+            
+            log(level, message, data = null) {
+                const timestamp = new Date().toLocaleTimeString();
+                const logEntry = {
+                    timestamp,
+                    level,
+                    message,
+                    data
+                };
+                
+                this.logBuffer.push(logEntry);
+                if (this.logBuffer.length > this.maxLogEntries) {
+                    this.logBuffer.shift();
+                }
+                
+                // 更新日志显示
+                this.updateLogDisplay();
+                
+                // 控制台输出
+                const consoleMsg = `[${timestamp}] ${level}: ${message}`;
+                if (data) {
+                    console.log(consoleMsg, data);
+                } else {
+                    console.log(consoleMsg);
+                }
+            }
+            
+            updateLogDisplay() {
+                const container = document.getElementById('logContainer');
+                if (container) {
+                    const logHtml = this.logBuffer.map(entry => {
+                        const levelColor = {
+                            'ERROR': '#ff4444',
+                            'WARN': '#ffaa00',
+                            'INFO': '#00ff00',
+                            'DEBUG': '#00aaff',
+                            'VR': '#ff00ff'
+                        }[entry.level] || '#ffffff';
+                        
+                        return `<div style="color: ${levelColor}; margin-bottom: 2px;">
+                            [${entry.timestamp}] ${entry.level}: ${entry.message}
+                            ${entry.data ? '<br>&nbsp;&nbsp;→ ' + JSON.stringify(entry.data) : ''}
+                        </div>`;
+                    }).join('');
+                    
+                    container.innerHTML = logHtml;
+                    container.scrollTop = container.scrollHeight;
+                }
+            }
+            
+            init() {
+                try {
+                    this.log('INFO', '开始初始化VR立体视觉系统');
+                    this.setup3DScene();
+                    this.setupVR();
+                    this.setupPreviewCanvases();
+                    this.connectWebSocket();
+                    this.setupEventHandlers();
+                    
+                    this.log('INFO', 'Quest 3 双红外立体视觉初始化完成');
+                    this.sendLogToServer('INFO', 'Quest 3 双红外立体视觉初始化完成');
+                } catch (error) {
+                    this.log('ERROR', '初始化失败', error);
+                    this.sendLogToServer('ERROR', `初始化失败: ${error.message}`);
+                }
+            }
+            
+            setup3DScene() {
+                this.log('INFO', '开始设置3D场景 - 使用125°FOV优化配置');
+                
+                // 设置渲染器
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                this.renderer.setPixelRatio(window.devicePixelRatio);
+                this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+                document.body.appendChild(this.renderer.domElement);
+                
+                // 设置场景背景为黑色
+                this.scene.background = new THREE.Color(0x000000);
+                
+                // ⭐️ 使用计算出的精确屏幕尺寸（消除窗口效应）
+                const { screenWidth, screenHeight, displayDistance, vfovDeg, eyeOffset } = this.vrDisplayParams;
+                
+                // 创建匹配物理相机FOV的显示平面
+                const planeGeometry = new THREE.PlaneGeometry(screenWidth, screenHeight);
+                
+                // 🔧 创建初始纹理
+                const createInitialTexture = () => {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = this.cameraSpecs.imageWidth;
+                    canvas.height = this.cameraSpecs.imageHeight;
+                    const ctx = canvas.getContext('2d');
+                    ctx.fillStyle = '#1a1a1a';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    ctx.fillStyle = '#4CAF50';
+                    ctx.font = '20px Arial';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('等待125°FOV红外数据...', canvas.width/2, canvas.height/2 - 20);
+                    ctx.fillText(`基线距离: ${this.cameraSpecs.baseline * 1000}mm`, canvas.width/2, canvas.height/2 + 20);
+                    
+                    return new THREE.CanvasTexture(canvas);
+                };
+                
+                // 创建左右眼纹理和材质
+                this.leftIRTexture = createInitialTexture();
+                this.leftIRTexture.format = THREE.RGBFormat;
+                this.leftIRTexture.minFilter = THREE.LinearFilter;
+                this.leftIRTexture.magFilter = THREE.LinearFilter;
+                this.leftIRTexture.flipY = false;
+                
+                this.leftEyeMaterial = new THREE.MeshBasicMaterial({ 
+                    map: this.leftIRTexture,
+                    side: THREE.FrontSide,
+                    depthTest: false,
+                    transparent: false
+                });
+                
+                this.rightIRTexture = createInitialTexture();
+                this.rightIRTexture.format = THREE.RGBFormat;
+                this.rightIRTexture.minFilter = THREE.LinearFilter;
+                this.rightIRTexture.magFilter = THREE.LinearFilter;
+                this.rightIRTexture.flipY = false;
+                
+                this.rightEyeMaterial = new THREE.MeshBasicMaterial({ 
+                    map: this.rightIRTexture,
+                    side: THREE.FrontSide,
+                    depthTest: false,
+                    transparent: false
+                });
+                
+                // ⭐️ VR模式：每只眼睛都看到正前方的平面（WebXR会自动处理立体效果）
+                // 关键：不要在空间中偏移平面，而是让WebXR的左右眼相机各自渲染对应的层
+                this.vrLeftPlane = new THREE.Mesh(planeGeometry, this.leftEyeMaterial);
+                this.vrLeftPlane.position.set(0, 0, -displayDistance); // 正前方
+                this.vrLeftPlane.layers.set(this.LEFT_EYE_LAYER);
+                this.vrLeftPlane.visible = false;
+                this.scene.add(this.vrLeftPlane);
+                
+                this.vrRightPlane = new THREE.Mesh(planeGeometry.clone(), this.rightEyeMaterial);
+                this.vrRightPlane.position.set(0, 0, -displayDistance); // 正前方
+                this.vrRightPlane.layers.set(this.RIGHT_EYE_LAYER);
+                this.vrRightPlane.visible = false;
+                this.scene.add(this.vrRightPlane);
+                
+                // 预览模式：创建两个重叠平面（用于测试校正效果）
+                const previewGeometry = new THREE.PlaneGeometry(2.4, 1.8); // 稍小的预览尺寸
+                this.previewLeftPlane = new THREE.Mesh(previewGeometry, this.leftEyeMaterial);
+                this.previewRightPlane = new THREE.Mesh(previewGeometry, this.rightEyeMaterial);
+                
+                // ⭐️ 设置为相同位置，用于观察校正效果（无偏移测试）
+                this.previewLeftPlane.position.set(0, 0, -2.5);  // 居中显示
+                this.previewRightPlane.position.set(0, 0, -2.4); // 稍微前移，避免Z-fighting
+                
+                this.scene.add(this.previewLeftPlane);
+                this.scene.add(this.previewRightPlane);
+                
+                // ⭐️ 更新主相机FOV以匹配物理相机
+                this.camera.fov = vfovDeg;
+                this.camera.position.set(0, 0, 0);
+                this.camera.updateProjectionMatrix();
+                
+                // 添加光照
+                const ambientLight = new THREE.AmbientLight(0xffffff, 1.0);
+                this.scene.add(ambientLight);
+                
+                this.log('INFO', `3D场景设置完成 - FOV:${vfovDeg.toFixed(1)}°, 屏幕:${screenWidth.toFixed(2)}×${screenHeight.toFixed(2)}m, 基线偏移:±${(eyeOffset*1000).toFixed(1)}mm`);
+            }
+            
+            setupVR() {
+                this.log('INFO', '开始设置WebXR VR环境');
+                
+                // 启用WebXR
+                this.renderer.xr.enabled = true;
+                this.log('DEBUG', 'WebXR已在渲染器中启用');
+                
+                // 检查WebXR支持
+                if ('xr' in navigator) {
+                    this.log('INFO', '浏览器支持WebXR');
+                    navigator.xr.isSessionSupported('immersive-vr').then(supported => {
+                        this.log('INFO', `immersive-vr会话支持: ${supported}`);
+                    });
+                } else {
+                    this.log('WARN', '浏览器不支持WebXR');
+                }
+                
+                // 创建VR按钮 - 使用标准WebXR功能
+                const vrButton = VRButton.createButton(this.renderer);
+                vrButton.style.cssText = `
+                    position: absolute;
+                    bottom: 20px;
+                    right: 20px;
+                    padding: 15px 25px;
+                    font-size: 16px;
+                    font-weight: bold;
+                    background: linear-gradient(45deg, #4CAF50, #45a049);
+                    color: white;
+                    border: none;
+                    border-radius: 25px;
+                    cursor: pointer;
+                    z-index: 1000;
+                    box-shadow: 0 4px 15px rgba(76, 175, 80, 0.3);
+                    transition: all 0.3s ease;
+                `;
+                vrButton.addEventListener('mouseenter', () => {
+                    vrButton.style.transform = 'translateY(-2px)';
+                    vrButton.style.boxShadow = '0 6px 20px rgba(76, 175, 80, 0.4)';
+                });
+                vrButton.addEventListener('mouseleave', () => {
+                    vrButton.style.transform = 'translateY(0)';
+                    vrButton.style.boxShadow = '0 4px 15px rgba(76, 175, 80, 0.3)';
+                });
+                document.getElementById('vrButton').appendChild(vrButton);
+                
+                // VR会话事件
+                this.renderer.xr.addEventListener('sessionstart', () => this.onVRStart());
+                this.renderer.xr.addEventListener('sessionend', () => this.onVREnd());
+                
+                // 启动渲染循环 - 使用WebXR兼容的方法
+                this.renderer.setAnimationLoop((time, frame) => {
+                    // WebXR会自动为每只眼睛调用这个函数
+                    // frame参数包含每只眼睛的视图信息
+                    this.render(time, frame);
+                });
+                
+                // 设置WebXR参考空间类型
+                this.renderer.xr.setReferenceSpaceType('local');
+                
+                this.log('INFO', 'WebXR兼容的渲染循环已启动');
+            }
+            
+            setupPreviewCanvases() {
+                // 设置预览画布大小
+                const updateCanvasSize = () => {
+                    const container = document.getElementById('preview-container');
+                    const rect = container.getBoundingClientRect();
+                    
+                    this.leftEyeCanvas.width = rect.width / 2;
+                    this.leftEyeCanvas.height = rect.height;
+                    this.rightEyeCanvas.width = rect.width / 2;
+                    this.rightEyeCanvas.height = rect.height;
+                };
+                
+                updateCanvasSize();
+                window.addEventListener('resize', updateCanvasSize);
+            }
+            
+            connectWebSocket() {
+                try {
+                    const WS_HOST = window.location.hostname || 'localhost';
+                    const WS_PORT = 8765;
+                    
+                    // 使用安全的WebSocket连接 (wss://) 当页面通过HTTPS加载时
+                    const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    const WS_URL = `${WS_PROTOCOL}//${WS_HOST}:${WS_PORT}`;
+                    
+                    console.log(`尝试连接到: ${WS_URL}`);
+                    this.updateStatus('wsStatus', '连接中...', 'status-connecting');
+                    
+                    this.websocket = new WebSocket(WS_URL);
+                    
+                    this.websocket.onopen = () => {
+                        console.log('WebSocket连接已建立');
+                        this.isConnected = true;
+                        this.updateStatus('wsStatus', '已连接', 'status-connected');
+                        this.sendLogToServer('INFO', 'WebSocket连接已建立');
+                    };
+                    
+                    this.websocket.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            this.handleWebSocketMessage(data);
+                        } catch (error) {
+                            console.error('解析WebSocket消息失败:', error);
+                        }
+                    };
+                    
+                    this.websocket.onclose = () => {
+                        console.log('WebSocket连接关闭');
+                        this.isConnected = false;
+                        this.updateStatus('wsStatus', '未连接', 'status-disconnected');
+                        this.updateStatus('irStatus', '未接收', 'status-disconnected');
+                        this.sendLogToServer('WARN', 'WebSocket连接已断开');
+                        
+                        // 尝试重连
+                        setTimeout(() => this.connectWebSocket(), 3000);
+                    };
+                    
+                    this.websocket.onerror = (error) => {
+                        console.error('WebSocket错误:', error);
+                        this.updateStatus('wsStatus', '错误', 'status-disconnected');
+                    };
+                    
+                } catch (error) {
+                    console.error('WebSocket连接失败:', error);
+                    this.updateStatus('wsStatus', '连接失败', 'status-disconnected');
+                }
+            }
+            
+            handleWebSocketMessage(data) {
+                switch (data.type) {
+                    case 'connection_established':
+                        console.log('传感器连接已建立:', data.camera_info);
+                        this.sendLogToServer('INFO', `传感器连接: ${data.camera_info.width}x${data.camera_info.height}@${data.camera_info.fps}fps`);
+                        break;
+                        
+                    case 'dual_infrared_frame':
+                        this.handleInfraredFrame(data);
+                        break;
+                        
+                    default:
+                        console.warn('未知消息类型:', data.type);
+                }
+            }
+            
+            handleInfraredFrame(data) {
+                const { left_infrared, right_infrared, timestamp, metadata } = data;
+
+                if (!left_infrared || !right_infrared) {
+                    console.warn('❌ 缺少红外数据');
+                    return;
+                }
+
+                // 1. 更新预览画布（非VR模式下观看）
+                this.updatePreviewCanvas(this.leftEyeCtx, left_infrared);
+                this.updatePreviewCanvas(this.rightEyeCtx, right_infrared);
+
+                // 2. ⭐️ 如果VR激活，更新Layer Canvas和THREE.js纹理
+                if (this.isVRActive && this.leftLayerCtx && this.rightLayerCtx) {
+                    this.updateLayerCanvas(this.leftLayerCtx, left_infrared);
+                    this.updateLayerCanvas(this.rightLayerCtx, right_infrared);
+                    
+                    // 更新THREE.js纹理
+                    if (this.leftIRTexture && this.rightIRTexture) {
+                        this.leftIRTexture.needsUpdate = true;
+                        this.rightIRTexture.needsUpdate = true;
+                    }
+                }
+
+                // 更新统计
+                this.frameCount++;
+                const currentTime = Date.now();
+                const latency = currentTime - (timestamp * 1000);
+                this.latencySum += latency;
+                this.latencyCount++;
+                this.updateDataRate();
+                this.updateLatencyDisplay();
+                this.updateStatus('irStatus', '实时接收', 'status-connected');
+            }
+
+            // 专门用于更新Canvas的辅助函数，避免代码重复
+            updateLayerCanvas(ctx, base64Data) {
+                if (!ctx.image) {
+                    ctx.image = new Image();
+                }
+                ctx.image.onload = () => {
+                    ctx.drawImage(ctx.image, 0, 0, ctx.canvas.width, ctx.canvas.height);
+                };
+                ctx.image.onerror = (e) => {
+                    console.error("图像加载到层画布失败:", e);
+                };
+                ctx.image.src = `data:image/jpeg;base64,${base64Data}`;
+            }
+
+            // 更新预览画布的辅助函数
+            updatePreviewCanvas(ctx, base64Data) {
+                if (!ctx.previewImage) {
+                    ctx.previewImage = new Image();
+                }
+                ctx.previewImage.onload = () => {
+                    ctx.drawImage(ctx.previewImage, 0, 0, ctx.canvas.width, ctx.canvas.height);
+                };
+                ctx.previewImage.onerror = (e) => {
+                    console.error("图像加载到预览画布失败:", e);
+                };
+                ctx.previewImage.src = `data:image/jpeg;base64,${base64Data}`;
+            }
+
+
+            async onVRStart() {
+                this.log('VR', 'VR会话开始 - 启用立体视觉渲染');
+                this.isVRActive = true;
+                document.body.classList.add('vr-mode');
+                this.updateStatus('vrStatus', 'VR活动', 'status-connected');
+
+                // 隐藏3D场景中的预览平面
+                this.previewLeftPlane.visible = false;
+                this.previewRightPlane.visible = false;
+
+                try {
+                    this.log('VR', '启用WebXR正确的立体层渲染');
+                    
+                    // ⭐️ 关键修复：直接控制WebXR相机的层设置
+                    const xrCamera = this.renderer.xr.getCamera();
+                    
+                    // 设置左眼相机只看左眼层 (layer 1)
+                    // 设置右眼相机只看右眼层 (layer 2)  
+                    this.renderer.xr.addEventListener('sessionstart', () => {
+                        // 在每帧渲染前设置相机层
+                        const originalRender = this.renderer.render;
+                        this.renderer.render = (scene, camera) => {
+                            if (this.renderer.xr.isPresenting) {
+                                const xrCamera = this.renderer.xr.getCamera();
+                                if (xrCamera.cameras && xrCamera.cameras.length >= 2) {
+                                    // ⭐️ 强制设置每个眼睛的相机层
+                                    xrCamera.cameras[0].layers.disableAll();
+                                    xrCamera.cameras[0].layers.enable(this.LEFT_EYE_LAYER);  // 左眼只看层1
+                                    
+                                    xrCamera.cameras[1].layers.disableAll(); 
+                                    xrCamera.cameras[1].layers.enable(this.RIGHT_EYE_LAYER); // 右眼只看层2
+                                    
+                                    this.log('DEBUG', `相机层设置: 左眼=${this.LEFT_EYE_LAYER}, 右眼=${this.RIGHT_EYE_LAYER}`);
+                                }
+                            }
+                            originalRender.call(this.renderer, scene, camera);
+                        };
+                    });
+
+                    // 显示VR平面并确保层设置
+                    this.vrLeftPlane.visible = true;
+                    this.vrRightPlane.visible = true;
+                    
+                    // ⭐️ 强制重新设置层归属
+                    this.vrLeftPlane.layers.disableAll();
+                    this.vrLeftPlane.layers.enable(this.LEFT_EYE_LAYER);
+                    
+                    this.vrRightPlane.layers.disableAll();
+                    this.vrRightPlane.layers.enable(this.RIGHT_EYE_LAYER);
+
+                    // ⭐️ 创建Canvas作为纹理源 - 使用实际视频流分辨率
+                    const leftLayerCanvas = document.createElement('canvas');
+                    leftLayerCanvas.width = this.cameraSpecs.imageWidth;   // 1280
+                    leftLayerCanvas.height = this.cameraSpecs.imageHeight; // 720
+                    this.leftLayerCtx = leftLayerCanvas.getContext('2d');
+                    this.leftLayerCtx.fillStyle = '#003300'; // 深绿色背景区分左眼
+                    this.leftLayerCtx.fillRect(0, 0, leftLayerCanvas.width, leftLayerCanvas.height);
+                    this.leftLayerCtx.fillStyle = '#00FF00';
+                    this.leftLayerCtx.font = 'bold 48px Arial';  // 增大字体适应更高分辨率
+                    this.leftLayerCtx.textAlign = 'center';
+                    this.leftLayerCtx.fillText('LEFT EYE', leftLayerCanvas.width/2, leftLayerCanvas.height/2 - 60);
+                    this.leftLayerCtx.fillText('1280x720 IR', leftLayerCanvas.width/2, leftLayerCanvas.height/2);
+                    this.leftLayerCtx.fillText('Layer: ' + this.LEFT_EYE_LAYER, leftLayerCanvas.width/2, leftLayerCanvas.height/2 + 60);
+
+                    const rightLayerCanvas = document.createElement('canvas');
+                    rightLayerCanvas.width = this.cameraSpecs.imageWidth;   // 1280
+                    rightLayerCanvas.height = this.cameraSpecs.imageHeight; // 720
+                    this.rightLayerCtx = rightLayerCanvas.getContext('2d');
+                    this.rightLayerCtx.fillStyle = '#000033'; // 深蓝色背景区分右眼
+                    this.rightLayerCtx.fillRect(0, 0, rightLayerCanvas.width, rightLayerCanvas.height);
+                    this.rightLayerCtx.fillStyle = '#0088FF';
+                    this.rightLayerCtx.font = 'bold 48px Arial';  // 增大字体适应更高分辨率
+                    this.rightLayerCtx.textAlign = 'center';
+                    this.rightLayerCtx.fillText('RIGHT EYE', rightLayerCanvas.width/2, rightLayerCanvas.height/2 - 60);
+                    this.rightLayerCtx.fillText('1280x720 IR', rightLayerCanvas.width/2, rightLayerCanvas.height/2);
+                    this.rightLayerCtx.fillText('Layer: ' + this.RIGHT_EYE_LAYER, rightLayerCanvas.width/2, rightLayerCanvas.height/2 + 60);
+
+                    // ⭐️ 更新THREE.js纹理
+                    this.leftIRTexture = new THREE.CanvasTexture(leftLayerCanvas);
+                    this.leftIRTexture.needsUpdate = true;
+                    this.leftEyeMaterial.map = this.leftIRTexture;
+                    this.leftEyeMaterial.needsUpdate = true;
+
+                    this.rightIRTexture = new THREE.CanvasTexture(rightLayerCanvas);
+                    this.rightIRTexture.needsUpdate = true;
+                    this.rightEyeMaterial.map = this.rightIRTexture;
+                    this.rightEyeMaterial.needsUpdate = true;
+
+                    // 保存Canvas引用
+                    this.leftLayerCanvas = leftLayerCanvas;
+                    this.rightLayerCanvas = rightLayerCanvas;
+
+                    this.log('VR', `立体层渲染已激活 - 左眼层:${this.LEFT_EYE_LAYER}, 右眼层:${this.RIGHT_EYE_LAYER}`);
+                    this.sendLogToServer('INFO', 'VR会话已启动，使用正确的立体层渲染');
+
+                } catch (error) {
+                    this.log('ERROR', 'VR初始化失败', error);
+                    this.sendLogToServer('ERROR', `VR初始化失败: ${error.message}`);
+                    
+                    // 降级到基础显示模式
+                    this.vrLeftPlane.visible = true;
+                    this.vrRightPlane.visible = true;
+                }
+            }
+            
+            onVREnd() {
+                this.log('VR', 'VR会话结束');
+                this.isVRActive = false;
+                document.body.classList.remove('vr-mode');
+                this.updateStatus('vrStatus', '未启动', 'status-disconnected');
+
+                // ⭐️ 清理VR相关资源
+                this.leftLayerCtx = null;
+                this.rightLayerCtx = null;
+                this.leftLayerCanvas = null;
+                this.rightLayerCanvas = null;
+                this.debugFrameCount = 0;
+
+                // 隐藏VR平面
+                this.vrLeftPlane.visible = false;
+                this.vrRightPlane.visible = false;
+
+                // 恢复预览模式显示
+                this.previewLeftPlane.visible = true;
+                this.previewRightPlane.visible = true;
+
+                // 重置相机层
+                this.camera.layers.enableAll();
+
+                this.log('DEBUG', '已恢复到预览模式');
+                this.sendLogToServer('INFO', 'VR会话已结束，回到预览模式');
+            }
+            
+            render(time, frame) {
+                // ⭐️ 在VR模式下，强制设置相机层分离
+                if (this.isVRActive && this.renderer.xr.isPresenting) {
+                    const xrCamera = this.renderer.xr.getCamera();
+                    if (xrCamera.cameras && xrCamera.cameras.length >= 2) {
+                        // 左眼相机 (index 0) 只看左眼层
+                        xrCamera.cameras[0].layers.disableAll();
+                        xrCamera.cameras[0].layers.enable(this.LEFT_EYE_LAYER);
+                        
+                        // 右眼相机 (index 1) 只看右眼层
+                        xrCamera.cameras[1].layers.disableAll();
+                        xrCamera.cameras[1].layers.enable(this.RIGHT_EYE_LAYER);
+                        
+                        // 确保VR平面在正确的层
+                        this.vrLeftPlane.layers.disableAll();
+                        this.vrLeftPlane.layers.enable(this.LEFT_EYE_LAYER);
+                        
+                        this.vrRightPlane.layers.disableAll();
+                        this.vrRightPlane.layers.enable(this.RIGHT_EYE_LAYER);
+                        
+                        // 调试日志 (每60帧输出一次)
+                        this.debugFrameCount++;
+                        if (this.debugFrameCount % 60 === 0) {
+                            this.log('DEBUG', `帧${this.debugFrameCount}: 左眼层=${this.LEFT_EYE_LAYER}, 右眼层=${this.RIGHT_EYE_LAYER}`);
+                            this.log('DEBUG', `左平面可见=${this.vrLeftPlane.visible}, 右平面可见=${this.vrRightPlane.visible}`);
+                        }
+                    }
+                    
+                    // 更新纹理
+                    if (this.leftIRTexture && this.rightIRTexture) {
+                        this.leftIRTexture.needsUpdate = true;
+                        this.rightIRTexture.needsUpdate = true;
+                    }
+                }
+
+                // 渲染三维场景
+                this.renderer.render(this.scene, this.camera);
+                
+                // 更新统计
+                this.updateDataRate();
+            }
+            
+            updateDataRate() {
+                const currentTime = Date.now();
+                const elapsed = currentTime - this.lastUpdateTime;
+                
+                if (elapsed >= 1000) { // 每秒更新一次
+                    const fps = Math.round(this.frameCount * 1000 / elapsed);
+                    this.updateStatus('dataRate', `${fps} FPS`, 'status-connected');
+                    
+                    this.frameCount = 0;
+                    this.lastUpdateTime = currentTime;
+                }
+            }
+            
+            updateLatencyDisplay() {
+                if (this.latencyCount >= 10) { // 每10帧更新一次延迟显示
+                    const avgLatency = Math.round(this.latencySum / this.latencyCount);
+                    this.updateStatus('latency', `${avgLatency}ms`, 
+                        avgLatency < 50 ? 'status-connected' : 'status-disconnected');
+                    
+                    this.latencySum = 0;
+                    this.latencyCount = 0;
+                }
+            }
+            
+            updateStatus(elementId, text, className) {
+                const element = document.getElementById(elementId);
+                if (element) {
+                    element.textContent = text;
+                    element.className = className;
+                }
+            }
+            
+            setupEventHandlers() {
+                // 窗口大小变化
+                window.addEventListener('resize', () => {
+                    this.camera.aspect = window.innerWidth / window.innerHeight;
+                    this.camera.updateProjectionMatrix();
+                    this.renderer.setSize(window.innerWidth, window.innerHeight);
+                });
+                
+                // 键盘快捷键
+                document.addEventListener('keydown', (event) => {
+                    switch (event.code) {
+                        case 'KeyR':
+                            // R键重连WebSocket
+                            if (!this.isConnected) {
+                                this.connectWebSocket();
+                            }
+                            break;
+                        case 'KeyF':
+                            // F键切换全屏
+                            if (!document.fullscreenElement) {
+                                document.documentElement.requestFullscreen();
+                            } else {
+                                document.exitFullscreen();
+                            }
+                            break;
+                    }
+                });
+            }
+            
+            sendLogToServer(level, message) {
+                // 如果有其他日志服务器可以发送到那里
+                console.log(`[${level}] ${message}`);
+                
+                // 可以扩展为发送到WebSocket服务器的日志功能
+                if (this.websocket && this.isConnected) {
+                    try {
+                        const logData = {
+                            type: 'client_log',
+                            level: level,
+                            message: message,
+                            timestamp: Date.now(),
+                            source: 'Quest3StereoIRViewer'
+                        };
+                        this.websocket.send(JSON.stringify(logData));
+                    } catch (error) {
+                        console.error('发送日志失败:', error);
+                    }
+                }
+            }
+        }
+        
+        // 启动应用
+        console.log('启动Quest 3 双红外传感器立体视觉显示器');
+        try {
+            const viewer = new Quest3StereoIRViewer();
+            window.vrViewer = viewer; // 便于调试
+        } catch (error) {
+            console.error('应用启动失败:', error);
+            
+            // 显示错误信息到页面
+            const errorDiv = document.createElement('div');
+            errorDiv.style.cssText = `
+                position: fixed;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                background: rgba(220, 53, 69, 0.9);
+                color: white;
+                padding: 20px;
+                border-radius: 10px;
+                text-align: center;
+                z-index: 10000;
+            `;
+            errorDiv.innerHTML = `
+                <h3>❌ 应用启动失败</h3>
+                <p>${error.message}</p>
+                <p style="font-size: 12px;">请检查控制台了解详细信息</p>
+            `;
+            document.body.appendChild(errorDiv);
+        }
+    </script>
+</body>
+</html>
