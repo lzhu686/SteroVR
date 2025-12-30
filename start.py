@@ -5,12 +5,12 @@
 同时启动 HTTPS 文件服务器 + WSS WebSocket 服务器
 
 使用方法:
-    python start_stereo_server.py
+    python start.py
 
 其他设备访问:
-    1. 浏览器打开: https://你的IP:8445/dual_infrared_vr_viewer.html
+    1. 浏览器打开: https://你的IP:8445
     2. 信任自签名证书
-    3. 页面会自动连接 wss://你的IP:8765
+    3. 选择查看模式（2D或VR）
 
 作者: Liang ZHU
 邮箱: lzhu686@connect.hkust-gz.edu.cn
@@ -72,16 +72,16 @@ def start_https_server(port=8445):
 
     print(f"🌐 HTTPS文件服务器启动在端口 {port}")
     print(f"📂 服务目录: {script_dir}")
-    print(f"🔗 本地访问: https://localhost:{port}/dual_infrared_vr_viewer.html")
-    print(f"🔗 局域网访问: https://{local_ip}:{port}/dual_infrared_vr_viewer.html")
+    print(f"🔗 本地访问: https://localhost:{port}")
+    print(f"🔗 局域网访问: https://{local_ip}:{port}")
 
     server.serve_forever()
 
 
 async def start_websocket_server():
     """启动 WSS WebSocket 服务器"""
-    # 导入 SSL 版本的服务器
-    from usb_stereo_websocket_server_ssl import USBStereoWebSocketServerSSL
+    # 导入服务器模块
+    from server import USBStereoWebSocketServerSSL
 
     server = USBStereoWebSocketServerSSL(
         host="0.0.0.0",
@@ -113,11 +113,11 @@ def main():
     print("📱 其他设备访问方法:")
     print("=" * 70)
     print(f"1. 在VR设备或手机浏览器打开:")
-    print(f"   https://{local_ip}:8445/dual_infrared_vr_viewer.html")
+    print(f"   https://{local_ip}:8445")
     print()
     print(f"2. 浏览器会提示证书不安全，选择'继续前往'或'信任此证书'")
     print()
-    print(f"3. 页面会自动连接到 WSS 服务器: wss://{local_ip}:8765")
+    print(f"3. 进入导航页面，选择'进入VR模式'或'打开2D查看器'")
     print("=" * 70 + "\n")
 
     # 启动 WebSocket 服务器 (这会阻塞)
