@@ -371,7 +371,7 @@
                     <div class="status-value" id="statusValue">离线</div>
                 </div>
                 <div class="status-item">
-                    <div class="status-label">实际帧率</div>
+                    <div class="status-label">服务器帧率</div>
                     <div class="status-value" id="fpsValue">0 FPS</div>
                 </div>
                 <div class="status-item">
@@ -410,7 +410,7 @@
                         等待左相机数据...
                     </div>
                     <img class="video-frame" id="leftIRFrame" style="display: none;" alt="左相机">
-                    <div class="fps-indicator" id="leftFPS">0 FPS</div>
+                    <div class="fps-indicator" id="leftFPS">客户端: 0 FPS</div>
                     <div class="metadata-panel" id="leftMetadata">
                         位置: 相机左侧 • 用途: 立体视觉左视图
                     </div>
@@ -425,7 +425,7 @@
                         等待右相机数据...
                     </div>
                     <img class="video-frame" id="rightIRFrame" style="display: none;" alt="右相机">
-                    <div class="fps-indicator" id="rightFPS">0 FPS</div>
+                    <div class="fps-indicator" id="rightFPS">客户端: 0 FPS</div>
                     <div class="metadata-panel" id="rightMetadata">
                         位置: 相机右侧 • 用途: 立体视觉右视图
                     </div>
@@ -576,23 +576,23 @@
 
         // 处理双红外帧数据
         function handleDualInfraredFrame(data) {
-            const { left_infrared, right_infrared, metadata, stats, timestamp } = data;
-            
+            const { left_infrared, right_infrared, metadata, stats: serverStats, timestamp } = data;
+
             // 更新图像
             if (left_infrared && right_infrared) {
                 updateInfraredFrame('left', left_infrared, metadata);
                 updateInfraredFrame('right', right_infrared, metadata);
-                
+
                 frameCount++;
                 stats.totalFrames++;
-                
+
                 // 计算延迟
                 const currentTime = Date.now();
                 const latency = currentTime - (timestamp * 1000);
                 elements.latencyValue.textContent = `${Math.round(latency)}ms`;
-                
+
                 // 更新统计信息
-                updateStats(stats, metadata);
+                updateStats(serverStats, metadata);
                 updateFrameRate();
             }
         }
@@ -630,16 +630,17 @@
             }
         }
 
-        // 更新帧率显示
+        // 更新帧率显示（客户端接收帧率）
         function updateFrameRate() {
             const currentTime = Date.now();
             stats.framesSinceLastUpdate++;
-            
+
             if (currentTime - stats.lastFPSUpdate >= 1000) {
-                const fps = stats.framesSinceLastUpdate;
-                elements.leftFPS.textContent = `${fps} FPS`;
-                elements.rightFPS.textContent = `${fps} FPS`;
-                
+                const clientFPS = stats.framesSinceLastUpdate;
+                // 显示客户端接收帧率（应该与服务器实际帧率接近）
+                elements.leftFPS.textContent = `客户端: ${clientFPS} FPS`;
+                elements.rightFPS.textContent = `客户端: ${clientFPS} FPS`;
+
                 stats.framesSinceLastUpdate = 0;
                 stats.lastFPSUpdate = currentTime;
             }
