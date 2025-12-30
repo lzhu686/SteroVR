@@ -53,7 +53,7 @@ STEREO_HEIGHT = 720     # 双目拼接图像高度
 CAMERA_WIDTH = 1280     # 单目图像宽度 (STEREO_WIDTH/2)
 CAMERA_HEIGHT = 720     # 单目图像高度
 TARGET_FPS = 60         # 目标帧率
-JPEG_QUALITY = 100      # JPEG压缩质量
+JPEG_QUALITY = 85       # JPEG压缩质量 (优化: 100→85, 提升编码速度)
 CAMERA_BUFFERSIZE = 1   # 相机缓冲区大小 (减少延迟)
 
 # USB带宽优化设置
@@ -183,6 +183,7 @@ class USBStereoWebSocketServerSSL:
         self.camera_thread = None
         self.frame_lock = threading.Lock()
         self.latest_frames = (None, None)
+        self.current_frame_id = 0  # 添加帧序列号
 
         # 测试模式
         self.test_mode = False
@@ -195,7 +196,10 @@ class USBStereoWebSocketServerSSL:
             'start_time': time.time(),
             'last_frame_time': 0,
             'fps_actual': 0,
-            'compression_ratio': 0
+            'fps_sent': 0,  # 添加发送帧率统计
+            'compression_ratio': 0,
+            'last_fps_calc_time': time.time(),  # FPS计算时间戳
+            'frames_sent_last_second': 0  # 上一秒发送的帧数
         }
 
         # 图像编码配置
@@ -234,8 +238,17 @@ class USBStereoWebSocketServerSSL:
             actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+            actual_fourcc = int(self.cap.get(cv2.CAP_PROP_FOURCC))
+            fourcc_str = "".join([chr((actual_fourcc >> 8 * i) & 0xFF) for i in range(4)])
 
             logger.info(f"✅ 相机配置成功: {actual_width}x{actual_height} @ {actual_fps:.1f}fps")
+            logger.info(f"📹 编码格式: {fourcc_str}")
+            logger.info(f"🔧 目标配置: {self.stereo_width}x{self.stereo_height} @ {self.target_fps}fps")
+
+            # 性能警告
+            if actual_fps < self.target_fps * 0.5:
+                logger.warning(f"⚠️ 相机实际帧率({actual_fps:.1f})远低于目标({self.target_fps})，可能受硬件限制")
+                logger.warning(f"💡 建议: 1) 检查USB连接(使用USB3.0); 2) 降低分辨率; 3) 降低JPEG_QUALITY")
 
             # 测试读取
             ret, frame = self.cap.read()
@@ -284,6 +297,10 @@ class USBStereoWebSocketServerSSL:
         frame_count = 0
         fps_start_time = time.time()
 
+        # 性能监控
+        total_capture_time = 0
+        capture_count = 0
+
         while self.is_camera_running:
             try:
                 loop_start = time.time()
@@ -291,7 +308,11 @@ class USBStereoWebSocketServerSSL:
                 if self.test_mode:
                     left_image, right_image = self.generate_test_frames()
                 else:
+                    capture_start = time.time()
                     ret, stereo_frame = self.cap.read()
+                    capture_time = time.time() - capture_start
+                    total_capture_time += capture_time
+                    capture_count += 1
 
                     if ret and stereo_frame is not None:
                         height = stereo_frame.shape[0]
@@ -303,6 +324,7 @@ class USBStereoWebSocketServerSSL:
 
                 with self.frame_lock:
                     self.latest_frames = (left_image.copy(), right_image.copy())
+                    self.current_frame_id += 1  # 每捕获一帧就递增帧ID
 
                 self.stats['frames_captured'] += 1
                 self.stats['last_frame_time'] = time.time()
@@ -313,6 +335,13 @@ class USBStereoWebSocketServerSSL:
                     actual_fps = 60.0 / (current_time - fps_start_time)
                     self.stats['fps_actual'] = actual_fps
                     fps_start_time = current_time
+
+                    # 性能诊断
+                    if not self.test_mode and capture_count > 0:
+                        avg_capture_time = (total_capture_time / capture_count) * 1000
+                        logger.info(f"📊 采集性能: FPS={actual_fps:.1f}, 平均采集耗时={avg_capture_time:.1f}ms")
+                        total_capture_time = 0
+                        capture_count = 0
 
                 elapsed = time.time() - loop_start
                 if elapsed < frame_interval:
@@ -329,6 +358,8 @@ class USBStereoWebSocketServerSSL:
     def encode_images(self, left_image: np.ndarray, right_image: np.ndarray,
                      quality: int = 80) -> Tuple[str, str, dict]:
         """编码图像为Base64字符串"""
+        encode_start = time.time()
+
         try:
             if len(left_image.shape) == 2:
                 left_bgr = cv2.cvtColor(left_image, cv2.COLOR_GRAY2BGR)
@@ -352,13 +383,17 @@ class USBStereoWebSocketServerSSL:
             compressed_size = len(left_buffer) + len(right_buffer)
             compression_ratio = compressed_size / original_size
 
+            encode_time = (time.time() - encode_start) * 1000  # 转换为毫秒
+
             metadata = {
                 'width': left_image.shape[1],
                 'height': left_image.shape[0],
                 'quality': quality,
                 'compression_ratio': compression_ratio,
+                'compressed_size': compressed_size,
                 'timestamp': time.time(),
-                'rectified': self.enable_rectify
+                'rectified': self.enable_rectify,
+                'encode_time_ms': round(encode_time, 2)  # 添加编码耗时
             }
 
             self.stats['compression_ratio'] = compression_ratio
@@ -403,8 +438,10 @@ class USBStereoWebSocketServerSSL:
                 'camera_info': {
                     'stereo_width': self.stereo_width,
                     'stereo_height': self.stereo_height,
-                    'camera_width': self.camera_width,
-                    'camera_height': self.camera_height,
+                    'width': self.camera_width,  # 修复字段名
+                    'height': self.camera_height,  # 修复字段名
+                    'camera_width': self.camera_width,  # 保留兼容性
+                    'camera_height': self.camera_height,  # 保留兼容性
                     'fps': self.target_fps,
                     'format': 'usb_stereo_rgb',
                     'rectified': self.enable_rectify,
@@ -424,16 +461,27 @@ class USBStereoWebSocketServerSSL:
             # 主循环
             frame_interval = 1.0 / self.target_fps
             last_send_time = 0
+            last_sent_frame_id = -1  # 跟踪上次发送的帧ID
+            fps_counter = 0  # 每秒发送帧计数
+            fps_timer = time.time()
 
             while True:
                 current_time = time.time()
 
+                # 帧率限制
                 if current_time - last_send_time < frame_interval:
                     await asyncio.sleep(0.005)
                     continue
 
+                # 获取最新帧和帧ID
                 with self.frame_lock:
                     left_image, right_image = self.latest_frames
+                    current_frame_id = self.current_frame_id
+
+                # 跳过重复帧：如果帧ID与上次发送的相同，说明没有新帧
+                if current_frame_id == last_sent_frame_id:
+                    await asyncio.sleep(0.001)
+                    continue
 
                 if left_image is not None and right_image is not None:
                     quality = self.adaptive_quality_adjustment(
@@ -449,11 +497,13 @@ class USBStereoWebSocketServerSSL:
                         message = {
                             'type': 'dual_infrared_frame',
                             'timestamp': current_time,
+                            'frame_id': current_frame_id,  # 添加真实帧ID
                             'left_infrared': left_b64,
                             'right_infrared': right_b64,
                             'metadata': metadata,
                             'stats': {
                                 'fps_actual': round(self.stats['fps_actual'], 1),
+                                'fps_sent': round(self.stats.get('fps_sent', 0), 1),  # 添加发送FPS
                                 'frames_captured': self.stats['frames_captured'],
                                 'frames_sent': self.stats['frames_sent'],
                                 'client_count': self.client_count,
@@ -468,6 +518,14 @@ class USBStereoWebSocketServerSSL:
                         self.stats['frames_sent'] += 1
                         self.stats['bytes_sent'] += len(json.dumps(message))
                         last_send_time = current_time
+                        last_sent_frame_id = current_frame_id  # 记录已发送的帧ID
+                        fps_counter += 1
+
+                        # 每秒计算一次发送FPS
+                        if current_time - fps_timer >= 1.0:
+                            self.stats['fps_sent'] = fps_counter / (current_time - fps_timer)
+                            fps_counter = 0
+                            fps_timer = current_time
 
                 try:
                     pong_waiter = await websocket.ping()
