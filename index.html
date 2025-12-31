@@ -231,6 +231,17 @@
         </div>
 
         <div class="info-panel">
+            <h3>⚠️ 首次使用请先信任证书</h3>
+            <p style="margin: 15px 0; opacity: 0.9;">视频流使用WSS加密传输，需要单独信任证书才能连接</p>
+            <a id="trustCertBtn" class="btn" style="background: linear-gradient(45deg, #FF9800, #F57C00);">
+                点击信任WSS证书 (端口8765)
+            </a>
+            <p style="margin-top: 10px; font-size: 0.85em; opacity: 0.7;">
+                点击后会打开新页面，选择"高级"→"继续前往"即可
+            </p>
+        </div>
+
+        <div class="info-panel">
             <h3>📋 系统信息</h3>
             <div class="info-grid">
                 <div class="info-item">
@@ -262,24 +273,19 @@
     </div>
 
     <script>
+        // 设置WSS证书信任链接
+        const host = window.location.hostname || 'localhost';
+        const trustBtn = document.getElementById('trustCertBtn');
+        trustBtn.href = `https://${host}:8765`;
+        trustBtn.target = '_blank';
+        trustBtn.onclick = () => window.open(`https://${host}:8765`, '_blank');
+
         // 检测VR支持
         if ('xr' in navigator) {
             navigator.xr.isSessionSupported('immersive-vr').then((supported) => {
-                if (supported) {
-                    console.log('✅ 设备支持WebXR VR');
-                } else {
-                    console.log('❌ 设备不支持WebXR VR');
-                }
+                console.log(supported ? '✅ 设备支持WebXR VR' : '❌ 设备不支持WebXR VR');
             });
-        } else {
-            console.log('❌ 浏览器不支持WebXR');
         }
-
-        // 页面加载时的欢迎信息
-        console.log('🎥 双目RGB相机 立体视觉系统');
-        console.log('选择查看模式：');
-        console.log('- 2D监视器查看：web/dual_infrared_viewer.html');
-        console.log('- VR立体视觉：web/dual_infrared_vr_viewer.html');
     </script>
 </body>
 </html>
