@@ -1,228 +1,546 @@
-# PICO 体感追踪集成方案
+# PICO 体感追踪 + OpenCV 双目相机集成方案
 
-## 一句话总结
+## 系统架构
 
-**问题**: PICO体感追踪器不支持网页(WebXR)
-**解决**: 用PC做中转站，把追踪数据通过WebSocket发给浏览器
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              完整数据流                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                     PICO 头显 (修改版 Unity Client)                  │   │
+│  │                                                                      │   │
+│  │   ┌─────────────────────┐      ┌─────────────────────────────────┐  │   │
+│  │   │ 追踪数据采集 (原有)  │      │ 立体视觉显示 (新增)              │  │   │
+│  │   │ - 头部 6DoF         │      │ - WebSocket 接收相机帧           │  │   │
+│  │   │ - 手柄 6DoF         │      │ - 左右眼分离渲染                 │  │   │
+│  │   │ - 全身 24 关节      │      │ - VR 立体显示                    │  │   │
+│  │   └─────────┬───────────┘      └──────────────┬──────────────────┘  │   │
+│  └─────────────┼─────────────────────────────────┼──────────────────────┘   │
+│                │ gRPC (追踪数据)                  │ WebSocket (视频帧)       │
+│                ▼                                  ▼                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                         Linux PC (Ubuntu 22.04)                      │   │
+│  │                                                                      │   │
+│  │   ┌─────────────────────┐      ┌─────────────────────────────────┐  │   │
+│  │   │ XRoboToolkit        │      │ 你的 server.py                   │  │   │
+│  │   │ PC-Service          │      │                                  │  │   │
+│  │   │ - 接收追踪数据       │      │ ┌─────────────────────────────┐ │  │   │
+│  │   │ - gRPC 服务         │      │ │ OpenCV 双目相机采集          │ │  │   │
+│  │   └─────────┬───────────┘      │ │ - cv2.VideoCapture()        │ │  │   │
+│  │             │                   │ │ - 左右图像分离               │ │  │   │
+│  │   ┌─────────▼───────────┐      │ │ - JPEG 编码                  │ │  │   │
+│  │   │ Python 绑定 (pxrea) │      │ └─────────────────────────────┘ │  │   │
+│  │   │ - 获取追踪数据       │─────>│                                  │  │   │
+│  │   │ - 回调函数          │      │ ┌─────────────────────────────┐ │  │   │
+│  │   └─────────────────────┘      │ │ WebSocket 服务器             │ │  │   │
+│  │                                 │ │ - 发送相机帧                 │ │  │   │
+│  │                                 │ │ - 发送追踪数据               │ │  │   │
+│  │                                 │ └─────────────────────────────┘ │  │   │
+│  │                                 └─────────────────────────────────┘  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-# ⚠️ 重要限制：XRoboToolkit 与 WebXR 不能同时运行
+# 第一部分：PC 端环境搭建
 
-## 问题确认
+## 1.1 安装 XRoboToolkit PC-Service
 
-经过官方文档验证，**XRoboToolkit-Unity-Client 需要占用 VR 显示**：
-
-| 事实 | 说明 |
-|------|------|
-| Unity Client 是独立 VR 应用 | 有自己的 UI 界面，显示 "WORKING" 等状态 |
-| 占用 VR 渲染资源 | 不能与 PICO 浏览器同时在前台运行 |
-| PICO 系统限制 | 同一时间只能有一个 VR 应用在前台 |
-
-**结论**: 你不能一边运行 XRoboToolkit APP 采集追踪数据，一边用浏览器看 WebXR 立体视觉。
-
----
-
-## 解决方案对比
-
-### 方案 A：使用 XRoboToolkit 内置 Remote Vision (最简单！)
-
-**重要发现**: XRoboToolkit **已经内置立体视觉功能**！
-
-根据[官方论文](https://arxiv.org/html/2508.00097v1)，Remote Vision 支持两种视频源：
-
-| 视频源 | 说明 | 你的情况 |
-|--------|------|----------|
-| **PICO 头显摄像头** | PICO 4 Ultra 内置 VST 相机 | 需要企业版权限 |
-| **ZED Mini 相机** | 通过 XRoboToolkit-Robot-Vision 模块 | ✅ 可用！ |
-
-**关键信息**：
-- 立体视觉通过 `XRoboToolkit-Robot-Vision` 模块实现
-- 支持 ZED Mini 等外置立体相机
-- 使用自定义 Shader 调整瞳距，焦点约 3.3 英尺 (适合遥操作)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Linux PC                                                        │
-│  ┌─────────────────┐     ┌─────────────────────────────────┐    │
-│  │ 你的立体相机     │────>│ XRoboToolkit-Robot-Vision       │    │
-│  │ (USB相机/ZED)   │     │ - 编码立体视频                   │    │
-│  └─────────────────┘     │ - 发送到头显                     │    │
-│                          └─────────────────┬───────────────┘    │
-│                                             │                    │
-│  ┌─────────────────────────────────────────┐│                    │
-│  │ XRoboToolkit PC-Service                 ││                    │
-│  │ - 接收追踪数据                           ││                    │
-│  └─────────────────────────────────────────┘│                    │
-└──────────────────────────────────────────────┼──────────────────┘
-                                               │ WiFi
-┌──────────────────────────────────────────────┼──────────────────┐
-│  PICO 头显                                    ▼                  │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ XRoboToolkit Unity Client                                │    │
-│  │ - Remote Vision: Listen 接收视频                         │    │
-│  │ - Tracking: 发送追踪数据                                 │    │
-│  │ - 全部功能在一个APP内                                    │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**优点**:
-- ✅ **官方支持**，不需要改代码
-- ✅ 追踪 + 视觉在同一个应用
-- ✅ 延迟优化过 (<100ms)
-- ✅ 支持 ZED Mini 等立体相机
-
-**缺点**:
-- ❌ 你的相机可能需要适配 Robot-Vision 模块
-- ❌ 需要研究 Robot-Vision 的接口
-
-**需要确认**: 你的立体相机是什么型号？如果不是 ZED，可能需要写适配器
-
----
-
-### 方案 B：两阶段切换模式
-
-**思路**: 两个应用交替运行
-
-```
-阶段1: 校准/采集追踪数据
-┌─────────────────────────────────────────┐
-│ 运行 XRoboToolkit APP                    │
-│ - 采集追踪数据发送到 PC                  │
-│ - PC 保存追踪数据到文件/内存             │
-└─────────────────────────────────────────┘
-          ↓ 用户手动切换
-阶段2: 查看立体视觉
-┌─────────────────────────────────────────┐
-│ 打开 PICO 浏览器                         │
-│ - 显示 WebXR 立体视觉                    │
-│ - 使用之前采集的追踪数据                 │
-└─────────────────────────────────────────┘
-```
-
-**优点**:
-- ✅ 不需要大改代码
-- ✅ 保留 WebXR 方案
-
-**缺点**:
-- ❌ 不能实时追踪 (数据是之前采集的)
-- ❌ 用户体验差 (需要切换应用)
-
----
-
-### 方案 C：使用 PICO Streaming (PICO Link)
-
-**思路**: 让 PC 运行 VR 应用，PICO 只做显示器
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Linux/Windows PC                                                │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐  │
-│  │ USB 相机        │  │ SteamVR/OpenXR  │  │ XRoboToolkit    │  │
-│  │                 │  │ VR 应用         │  │ PC-Service      │  │
-│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘  │
-│           │                    │                     │           │
-│           └──────────┬─────────┴─────────────────────┘           │
-│                      ▼                                            │
-│              ┌─────────────────┐                                  │
-│              │ PICO Link/串流   │                                  │
-│              └────────┬────────┘                                  │
-└───────────────────────┼─────────────────────────────────────────┘
-                        │ WiFi/USB
-┌───────────────────────┼─────────────────────────────────────────┐
-│  PICO 头显            ▼                                          │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ PICO Link APP (串流接收器)                               │    │
-│  │ - 只显示 PC 传来的画面                                   │    │
-│  │ - 追踪数据发回 PC                                        │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**优点**:
-- ✅ 所有计算在 PC
-- ✅ 追踪 + 视觉可以同时工作
-- ✅ PICO Link 官方支持体感追踪数据传输
-
-**缺点**:
-- ❌ 需要高带宽低延迟网络
-- ❌ 需要 PC 端 VR 应用 (非浏览器)
-
----
-
-### 方案 D：修改 XRoboToolkit Unity Client (最灵活)
-
-**思路**: 在 XRoboToolkit Unity Client 中集成你的立体相机显示功能
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  修改后的 XRoboToolkit Unity Client                              │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ 新增模块: WebSocket 客户端                               │    │
-│  │ - 连接到你的 server.py                                   │    │
-│  │ - 接收相机帧                                             │    │
-│  │ - 渲染到 VR 眼镜                                         │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ 原有模块: 追踪数据采集                                    │    │
-│  │ - 照常发送到 PC-Service                                  │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-#### Fork 和开发环境设置
+PC-Service 是运行在电脑上的后台服务，负责接收 PICO 头显发来的追踪数据。
 
 ```bash
-# 1. Fork 仓库 (在 GitHub 网页上点 Fork，或用 gh 命令)
-gh repo fork XR-Robotics/XRoboToolkit-Unity-Client --clone
+# === 方法 A：直接安装预编译包 (推荐) ===
 
-# 2. 或者直接克隆官方仓库
+# 下载最新版本
+wget https://github.com/XR-Robotics/XRoboToolkit-PC-Service/releases/download/v1.1.1/xrobotoolkit-pc-service_1.1.1_amd64.deb
+
+# 安装
+sudo dpkg -i xrobotoolkit-pc-service_1.1.1_amd64.deb
+
+# 如果有依赖问题，运行：
+sudo apt-get install -f
+
+# 启动服务 (会在后台运行)
+xrobotoolkit-pc-service
+```
+
+```bash
+# === 方法 B：从源码编译 ===
+
+# 克隆仓库
+git clone https://github.com/XR-Robotics/XRoboToolkit-PC-Service.git
+cd XRoboToolkit-PC-Service
+
+# 安装依赖
+sudo apt-get install build-essential cmake qt6-base-dev libgrpc++-dev protobuf-compiler-grpc
+
+# 编译
+./build_linux.sh
+
+# 运行
+./build/xrobotoolkit-pc-service
+```
+
+**验证安装**：
+```bash
+# 查看服务是否运行
+ps aux | grep xrobotoolkit
+
+# 查看监听端口 (默认 50051)
+netstat -tlnp | grep 50051
+```
+
+---
+
+## 1.2 安装 Python 绑定 (pxrea)
+
+pxrea 是 Python 接口，让你的 server.py 能够获取追踪数据。
+
+```bash
+# 创建 Python 环境
+conda create -n xrobot python=3.10
+conda activate xrobot
+
+# 克隆 Python 绑定
+git clone https://github.com/XR-Robotics/XRoboToolkit-PC-Service-Pybind.git
+cd XRoboToolkit-PC-Service-Pybind
+
+# 安装
+pip install .
+
+# 验证安装
+python -c "import pxrea; print('pxrea 安装成功')"
+```
+
+---
+
+## 1.3 修改你的 server.py
+
+在你现有的 server.py 中添加追踪数据接收功能：
+
+```python
+# server.py - 完整示例
+
+import asyncio
+import websockets
+import json
+import cv2
+import threading
+import ssl
+from typing import Optional
+
+# ========== 追踪模块 ==========
+
+try:
+    import pxrea
+    HAS_TRACKING = True
+    print("[OK] pxrea 模块加载成功")
+except ImportError:
+    HAS_TRACKING = False
+    print("[警告] pxrea 未安装，追踪功能不可用")
+
+
+class BodyTracker:
+    """PICO 体感追踪数据接收器"""
+
+    # 关节名称映射
+    JOINT_NAMES = [
+        'Pelvis', 'SpineLower', 'SpineMiddle', 'SpineUpper',
+        'Chest', 'Neck', 'Head',
+        'LeftShoulder', 'LeftUpperArm', 'LeftLowerArm', 'LeftHand',
+        'RightShoulder', 'RightUpperArm', 'RightLowerArm', 'RightHand',
+        'LeftUpperLeg', 'LeftLowerLeg', 'LeftFoot',
+        'RightUpperLeg', 'RightLowerLeg', 'RightFoot',
+        'LeftToes', 'RightToes', 'LeftFingers', 'RightFingers'
+    ]
+
+    def __init__(self):
+        self.body_data = None
+        self.head_data = None
+        self.controller_data = {'left': None, 'right': None}
+        self.lock = threading.Lock()
+        self.frame_id = 0
+        self.connected = False
+
+    def _data_callback(self, data_type: int, data: dict):
+        """接收追踪数据的回调函数"""
+        with self.lock:
+            if data_type == 0x01:  # HEAD
+                self.head_data = data
+            elif data_type == 0x02:  # CONTROLLER
+                self.controller_data = data
+            elif data_type == 0x08:  # BODY (全身追踪)
+                self.body_data = data
+                self.frame_id += 1
+
+    def start(self) -> bool:
+        """启动追踪服务"""
+        if not HAS_TRACKING:
+            print("[错误] pxrea 未安装")
+            return False
+
+        # 初始化 pxrea
+        # 参数: (config, callback, data_mask)
+        # data_mask: 0x01=HEAD, 0x02=CONTROLLER, 0x04=HAND, 0x08=BODY, 0xFF=ALL
+        result = pxrea.PXREAInit(None, self._data_callback, 0xFF)
+
+        if result == 0:
+            self.connected = True
+            print("[OK] 追踪服务已启动，等待 PICO 连接...")
+            return True
+        else:
+            print(f"[错误] 追踪服务启动失败，错误码: {result}")
+            return False
+
+    def get_tracking_frame(self) -> Optional[dict]:
+        """获取最新一帧追踪数据"""
+        with self.lock:
+            if self.body_data is None:
+                return None
+
+            joints = {}
+            raw_joints = self.body_data.get('joints', [])
+
+            for i, joint in enumerate(raw_joints):
+                if i < len(self.JOINT_NAMES):
+                    joints[self.JOINT_NAMES[i]] = {
+                        'position': joint.get('position', [0, 0, 0]),
+                        'rotation': joint.get('rotation', [0, 0, 0, 1])
+                    }
+
+            return {
+                'type': 'body_tracking',
+                'frame_id': self.frame_id,
+                'timestamp': self.body_data.get('timestamp', 0),
+                'joints': joints,
+                'head': self.head_data,
+                'controllers': self.controller_data
+            }
+
+    def stop(self):
+        """停止追踪服务"""
+        if HAS_TRACKING and self.connected:
+            pxrea.PXREADeinit()
+            self.connected = False
+            print("[OK] 追踪服务已停止")
+
+
+# ========== 双目相机模块 ==========
+
+class StereoCamera:
+    """OpenCV 双目相机采集"""
+
+    def __init__(self, device_id: int = 0, width: int = 2560, height: int = 720):
+        """
+        初始化双目相机
+
+        参数:
+            device_id: 相机设备 ID
+            width: 双目图像总宽度 (左右拼接)
+            height: 图像高度
+        """
+        self.cap = cv2.VideoCapture(device_id)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+
+        self.width = width
+        self.height = height
+        self.half_width = width // 2
+
+        self.lock = threading.Lock()
+        self.left_frame = None
+        self.right_frame = None
+        self.frame_id = 0
+        self.running = False
+
+    def start(self):
+        """启动相机采集线程"""
+        if not self.cap.isOpened():
+            print("[错误] 无法打开相机")
+            return False
+
+        self.running = True
+        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+        print(f"[OK] 双目相机已启动 ({self.width}x{self.height})")
+        return True
+
+    def _capture_loop(self):
+        """相机采集循环"""
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret:
+                with self.lock:
+                    # 分离左右图像
+                    self.left_frame = frame[:, :self.half_width]
+                    self.right_frame = frame[:, self.half_width:]
+                    self.frame_id += 1
+
+    def get_stereo_frame(self, quality: int = 80) -> Optional[dict]:
+        """
+        获取编码后的立体帧
+
+        参数:
+            quality: JPEG 压缩质量 (1-100)
+
+        返回:
+            包含左右眼 base64 图像的字典
+        """
+        import base64
+
+        with self.lock:
+            if self.left_frame is None or self.right_frame is None:
+                return None
+
+            # JPEG 编码
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+            _, left_jpg = cv2.imencode('.jpg', self.left_frame, encode_param)
+            _, right_jpg = cv2.imencode('.jpg', self.right_frame, encode_param)
+
+            return {
+                'type': 'stereo_frame',
+                'frame_id': self.frame_id,
+                'left': base64.b64encode(left_jpg).decode('utf-8'),
+                'right': base64.b64encode(right_jpg).decode('utf-8'),
+                'width': self.half_width,
+                'height': self.height
+            }
+
+    def get_stereo_frame_binary(self) -> Optional[bytes]:
+        """
+        获取二进制格式的立体帧 (更高效)
+
+        返回:
+            格式: [4字节左图大小][左图JPEG][4字节右图大小][右图JPEG]
+        """
+        import struct
+
+        with self.lock:
+            if self.left_frame is None or self.right_frame is None:
+                return None
+
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+            _, left_jpg = cv2.imencode('.jpg', self.left_frame, encode_param)
+            _, right_jpg = cv2.imencode('.jpg', self.right_frame, encode_param)
+
+            left_bytes = left_jpg.tobytes()
+            right_bytes = right_jpg.tobytes()
+
+            # 打包: [left_size(4B)][left_data][right_size(4B)][right_data]
+            return (
+                struct.pack('<I', len(left_bytes)) + left_bytes +
+                struct.pack('<I', len(right_bytes)) + right_bytes
+            )
+
+    def stop(self):
+        """停止相机"""
+        self.running = False
+        if hasattr(self, 'thread'):
+            self.thread.join(timeout=1.0)
+        self.cap.release()
+        print("[OK] 相机已停止")
+
+
+# ========== WebSocket 服务器 ==========
+
+class StereoVRServer:
+    """WebSocket 服务器，发送双目视频和追踪数据"""
+
+    def __init__(self, host: str = '0.0.0.0', port: int = 8765):
+        self.host = host
+        self.port = port
+        self.camera = StereoCamera()
+        self.tracker = BodyTracker()
+        self.clients = set()
+
+    async def handler(self, websocket):
+        """处理 WebSocket 连接"""
+        self.clients.add(websocket)
+        client_ip = websocket.remote_address[0]
+        print(f"[连接] 客户端已连接: {client_ip}")
+
+        try:
+            while True:
+                # 发送相机帧 (二进制格式)
+                frame_data = self.camera.get_stereo_frame_binary()
+                if frame_data:
+                    await websocket.send(frame_data)
+
+                # 发送追踪数据 (JSON 格式)
+                tracking_data = self.tracker.get_tracking_frame()
+                if tracking_data:
+                    await websocket.send(json.dumps(tracking_data))
+
+                # 控制帧率 (~30fps)
+                await asyncio.sleep(1/30)
+
+        except websockets.exceptions.ConnectionClosed:
+            print(f"[断开] 客户端已断开: {client_ip}")
+        finally:
+            self.clients.discard(websocket)
+
+    async def start(self):
+        """启动服务器"""
+        # 启动相机
+        if not self.camera.start():
+            return
+
+        # 启动追踪
+        self.tracker.start()
+
+        # 配置 SSL (可选)
+        ssl_context = None
+        # ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        # ssl_context.load_cert_chain('cert.pem', 'key.pem')
+
+        # 启动 WebSocket 服务器
+        print(f"[OK] WebSocket 服务器启动: ws://{self.host}:{self.port}")
+
+        async with websockets.serve(
+            self.handler,
+            self.host,
+            self.port,
+            ssl=ssl_context,
+            max_size=10*1024*1024  # 10MB max message size
+        ):
+            await asyncio.Future()  # 永久运行
+
+    def stop(self):
+        """停止服务器"""
+        self.camera.stop()
+        self.tracker.stop()
+
+
+# ========== 主函数 ==========
+
+if __name__ == '__main__':
+    server = StereoVRServer(host='0.0.0.0', port=8765)
+
+    try:
+        asyncio.run(server.start())
+    except KeyboardInterrupt:
+        print("\n[OK] 服务器已停止")
+        server.stop()
+```
+
+---
+
+## 1.4 测试 PC 端
+
+```bash
+# 1. 启动 PC-Service (如果不是自动启动)
+xrobotoolkit-pc-service &
+
+# 2. 运行你的 server.py
+conda activate xrobot
+python server.py
+
+# 预期输出:
+# [OK] pxrea 模块加载成功
+# [OK] 双目相机已启动 (2560x720)
+# [OK] 追踪服务已启动，等待 PICO 连接...
+# [OK] WebSocket 服务器启动: ws://0.0.0.0:8765
+```
+
+---
+
+# 第二部分：Unity Client 修改
+
+## 2.1 获取 XRoboToolkit Unity Client
+
+```bash
+# 方法 1: Fork 到自己的账号 (推荐，方便后续更新)
+gh repo fork XR-Robotics/XRoboToolkit-Unity-Client --clone
+cd XRoboToolkit-Unity-Client
+
+# 方法 2: 直接克隆
 git clone https://github.com/XR-Robotics/XRoboToolkit-Unity-Client.git
 cd XRoboToolkit-Unity-Client
 
-# 3. 创建你的开发分支
-git checkout -b feature/custom-stereo-vision
-
-# 4. 用 Unity 打开项目 (需要 Unity 2021.3+ 或查看项目要求)
-# Unity Hub → Add → 选择克隆的文件夹
+# 创建开发分支
+git checkout -b feature/opencv-stereo-vision
 ```
 
-#### Unity 项目中添加 WebSocket 接收模块
+---
 
-**步骤 1**: 安装 WebSocket 库
+## 2.2 Unity 环境要求
 
-```
-在 Unity Package Manager 中添加:
-- NativeWebSocket: https://github.com/endel/NativeWebSocket.git
-或
-- WebSocketSharp (通过 NuGet)
-```
+| 要求 | 版本 |
+|------|------|
+| Unity | 2021.3 LTS 或更高 |
+| Android Build Support | 已安装 |
+| PICO Unity Integration SDK | 已配置 |
 
-**步骤 2**: 创建立体视觉接收脚本
+打开 Unity Hub → Add → 选择克隆的 XRoboToolkit-Unity-Client 文件夹
+
+---
+
+## 2.3 安装 WebSocket 依赖
+
+在 Unity 中，打开 `Window → Package Manager`：
+
+1. 点击 `+` → `Add package from git URL`
+2. 输入: `https://github.com/endel/NativeWebSocket.git#upm`
+3. 点击 `Add`
+
+---
+
+## 2.4 创建立体视觉接收脚本
+
+在 `Assets/Scripts/` 下创建 `StereoVisionReceiver.cs`:
 
 ```csharp
 // Assets/Scripts/StereoVisionReceiver.cs
+
 using UnityEngine;
 using NativeWebSocket;
 using System;
+using System.Threading.Tasks;
 
 public class StereoVisionReceiver : MonoBehaviour
 {
-    [Header("Server Settings")]
+    [Header("服务器设置")]
+    [Tooltip("PC 的 IP 地址")]
     public string serverIP = "192.168.1.100";
+
+    [Tooltip("WebSocket 端口")]
     public int serverPort = 8765;
 
-    [Header("Display")]
+    [Tooltip("使用 WSS (安全连接)")]
+    public bool useSSL = false;
+
+    [Header("显示设置")]
+    [Tooltip("左眼渲染材质")]
     public Material leftEyeMaterial;
+
+    [Tooltip("右眼渲染材质")]
     public Material rightEyeMaterial;
 
-    private WebSocket ws;
+    [Tooltip("渲染到的 Quad 对象")]
+    public GameObject displayQuad;
+
+    [Header("状态")]
+    [SerializeField] private bool isConnected = false;
+    [SerializeField] private int framesReceived = 0;
+    [SerializeField] private float fps = 0;
+
+    private WebSocket websocket;
     private Texture2D leftTexture;
     private Texture2D rightTexture;
+
+    // 双缓冲，避免主线程阻塞
     private byte[] pendingLeftData;
     private byte[] pendingRightData;
     private bool hasNewFrame = false;
+    private readonly object frameLock = new object();
+
+    // FPS 计算
+    private int frameCount = 0;
+    private float fpsTimer = 0;
 
     async void Start()
     {
@@ -230,100 +548,202 @@ public class StereoVisionReceiver : MonoBehaviour
         leftTexture = new Texture2D(1280, 720, TextureFormat.RGB24, false);
         rightTexture = new Texture2D(1280, 720, TextureFormat.RGB24, false);
 
-        // 连接 WebSocket
-        ws = new WebSocket($"wss://{serverIP}:{serverPort}");
+        // 应用纹理到材质
+        if (leftEyeMaterial != null)
+            leftEyeMaterial.mainTexture = leftTexture;
+        if (rightEyeMaterial != null)
+            rightEyeMaterial.mainTexture = rightTexture;
 
-        ws.OnMessage += (bytes) =>
-        {
-            // 解析你的 server.py 发送的帧格式
-            ProcessFrame(bytes);
-        };
-
-        ws.OnOpen += () => Debug.Log("[StereoVision] Connected to server");
-        ws.OnError += (e) => Debug.LogError($"[StereoVision] Error: {e}");
-        ws.OnClose += (e) => Debug.Log("[StereoVision] Disconnected");
-
-        await ws.Connect();
+        await ConnectToServer();
     }
 
-    void ProcessFrame(byte[] data)
+    async Task ConnectToServer()
     {
-        // 根据你 server.py 的数据格式解析
-        // 假设格式: [4字节左图大小][左图JPEG][4字节右图大小][右图JPEG]
+        string protocol = useSSL ? "wss" : "ws";
+        string url = $"{protocol}://{serverIP}:{serverPort}";
+
+        Debug.Log($"[StereoVision] 正在连接: {url}");
+
+        websocket = new WebSocket(url);
+
+        websocket.OnOpen += () =>
+        {
+            Debug.Log("[StereoVision] 连接成功!");
+            isConnected = true;
+        };
+
+        websocket.OnError += (e) =>
+        {
+            Debug.LogError($"[StereoVision] 错误: {e}");
+        };
+
+        websocket.OnClose += (e) =>
+        {
+            Debug.Log($"[StereoVision] 连接关闭: {e}");
+            isConnected = false;
+        };
+
+        websocket.OnMessage += (bytes) =>
+        {
+            ProcessMessage(bytes);
+        };
+
         try
         {
-            int leftSize = BitConverter.ToInt32(data, 0);
-            pendingLeftData = new byte[leftSize];
-            Array.Copy(data, 4, pendingLeftData, 0, leftSize);
-
-            int rightSize = BitConverter.ToInt32(data, 4 + leftSize);
-            pendingRightData = new byte[rightSize];
-            Array.Copy(data, 8 + leftSize, pendingRightData, 0, rightSize);
-
-            hasNewFrame = true;
+            await websocket.Connect();
         }
         catch (Exception e)
         {
-            Debug.LogError($"[StereoVision] Parse error: {e.Message}");
+            Debug.LogError($"[StereoVision] 连接失败: {e.Message}");
+        }
+    }
+
+    void ProcessMessage(byte[] data)
+    {
+        // 判断消息类型
+        // 二进制数据 (视频帧): 以 4 字节长度开头
+        // JSON 数据 (追踪): 以 '{' 开头
+
+        if (data.Length > 8 && data[0] != '{')
+        {
+            // 二进制视频帧
+            ProcessBinaryFrame(data);
+        }
+        else
+        {
+            // JSON 追踪数据
+            ProcessTrackingData(data);
+        }
+    }
+
+    void ProcessBinaryFrame(byte[] data)
+    {
+        try
+        {
+            // 格式: [4字节左图大小][左图JPEG][4字节右图大小][右图JPEG]
+            int leftSize = BitConverter.ToInt32(data, 0);
+            int rightSize = BitConverter.ToInt32(data, 4 + leftSize);
+
+            byte[] leftData = new byte[leftSize];
+            byte[] rightData = new byte[rightSize];
+
+            Array.Copy(data, 4, leftData, 0, leftSize);
+            Array.Copy(data, 8 + leftSize, rightData, 0, rightSize);
+
+            lock (frameLock)
+            {
+                pendingLeftData = leftData;
+                pendingRightData = rightData;
+                hasNewFrame = true;
+            }
+
+            framesReceived++;
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[StereoVision] 解析视频帧失败: {e.Message}");
+        }
+    }
+
+    void ProcessTrackingData(byte[] data)
+    {
+        try
+        {
+            string json = System.Text.Encoding.UTF8.GetString(data);
+            // 这里可以解析追踪数据并应用
+            // TrackingData tracking = JsonUtility.FromJson<TrackingData>(json);
+            // Debug.Log($"[Tracking] Frame: {tracking.frame_id}");
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[StereoVision] 解析追踪数据失败: {e.Message}");
         }
     }
 
     void Update()
     {
+        // WebSocket 消息分发 (必须在主线程)
         #if !UNITY_WEBGL || UNITY_EDITOR
-        ws?.DispatchMessageQueue();
+        websocket?.DispatchMessageQueue();
         #endif
 
-        // 在主线程更新纹理
-        if (hasNewFrame)
+        // 更新纹理 (必须在主线程)
+        lock (frameLock)
         {
-            leftTexture.LoadImage(pendingLeftData);
-            rightTexture.LoadImage(pendingRightData);
+            if (hasNewFrame && pendingLeftData != null && pendingRightData != null)
+            {
+                leftTexture.LoadImage(pendingLeftData);
+                rightTexture.LoadImage(pendingRightData);
+                hasNewFrame = false;
+                frameCount++;
+            }
+        }
 
-            leftEyeMaterial.mainTexture = leftTexture;
-            rightEyeMaterial.mainTexture = rightTexture;
-
-            hasNewFrame = false;
+        // 计算 FPS
+        fpsTimer += Time.deltaTime;
+        if (fpsTimer >= 1.0f)
+        {
+            fps = frameCount / fpsTimer;
+            frameCount = 0;
+            fpsTimer = 0;
         }
     }
 
     async void OnDestroy()
     {
-        if (ws != null && ws.State == WebSocketState.Open)
+        if (websocket != null && websocket.State == WebSocketState.Open)
         {
-            await ws.Close();
+            await websocket.Close();
         }
+    }
+
+    // 提供给 UI 调用的方法
+    public void SetServerIP(string ip)
+    {
+        serverIP = ip;
+    }
+
+    public async void Reconnect()
+    {
+        if (websocket != null)
+        {
+            await websocket.Close();
+        }
+        await ConnectToServer();
     }
 }
 ```
 
-**步骤 3**: 创建立体显示 Shader
+---
+
+## 2.5 创建立体显示 Shader
+
+在 `Assets/Shaders/` 下创建 `StereoDisplay.shader`:
 
 ```hlsl
 // Assets/Shaders/StereoDisplay.shader
+
 Shader "Custom/StereoDisplay"
 {
     Properties
     {
         _LeftTex ("Left Eye Texture", 2D) = "white" {}
         _RightTex ("Right Eye Texture", 2D) = "white" {}
-        _IPD ("Interpupillary Distance", Range(0.058, 0.072)) = 0.064
     }
 
     SubShader
     {
-        Tags { "RenderType"="Opaque" }
+        Tags { "RenderType"="Opaque" "Queue"="Geometry" }
+        LOD 100
 
         Pass
         {
             CGPROGRAM
             #pragma vertex vert
             #pragma fragment frag
-            #include "UnityCG.cginc"
+            #pragma multi_compile_instancing
 
-            sampler2D _LeftTex;
-            sampler2D _RightTex;
-            float _IPD;
+            #include "UnityCG.cginc"
 
             struct appdata
             {
@@ -339,13 +759,20 @@ Shader "Custom/StereoDisplay"
                 UNITY_VERTEX_OUTPUT_STEREO
             };
 
+            sampler2D _LeftTex;
+            sampler2D _RightTex;
+            float4 _LeftTex_ST;
+
             v2f vert (appdata v)
             {
                 v2f o;
+
                 UNITY_SETUP_INSTANCE_ID(v);
+                UNITY_INITIALIZE_OUTPUT(v2f, o);
                 UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
+
                 o.vertex = UnityObjectToClipPos(v.vertex);
-                o.uv = v.uv;
+                o.uv = TRANSFORM_TEX(v.uv, _LeftTex);
                 return o;
             }
 
@@ -353,561 +780,191 @@ Shader "Custom/StereoDisplay"
             {
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(i);
 
-                // 根据当前渲染的眼睛选择纹理
+                // 根据当前渲染的眼睛选择对应纹理
+                // unity_StereoEyeIndex: 0 = 左眼, 1 = 右眼
                 if (unity_StereoEyeIndex == 0)
-                    return tex2D(_LeftTex, i.uv);  // 左眼
+                {
+                    return tex2D(_LeftTex, i.uv);
+                }
                 else
-                    return tex2D(_RightTex, i.uv); // 右眼
+                {
+                    return tex2D(_RightTex, i.uv);
+                }
             }
             ENDCG
         }
     }
-}
-```
 
-**步骤 4**: 场景设置
-
-```
-1. 创建一个 Quad 放在相机前方
-2. 将 StereoDisplay 材质应用到 Quad
-3. 将 StereoVisionReceiver 脚本挂载到某个 GameObject
-4. 配置 server IP 和端口
-```
-
-**步骤 5**: 打包 APK
-
-```bash
-# 在 Unity 中:
-# File → Build Settings → Android → Switch Platform
-# Player Settings → XR Plug-in Management → 启用 PICO XR
-# Build → 生成 APK
-
-# 安装到 PICO
-adb install -r your_modified_app.apk
-```
-
-**优点**:
-- ✅ 追踪 + 视觉完全集成
-- ✅ 保留你现有的 server.py
-- ✅ 最低延迟
-- ✅ 完全可控
-
-**缺点**:
-- ❌ 需要 Unity 开发经验
-- ❌ 需要维护 Fork
-
----
-
-## 推荐选择
-
-| 你的需求 | 推荐方案 |
-|----------|----------|
-| **最简单，官方支持** | 方案 A (XRoboToolkit Remote Vision) |
-| 保留现有代码，愿意开发 | 方案 D (修改 Unity Client) |
-| 快速验证，不改代码 | 方案 B (两阶段切换) |
-| 已有 PC VR 应用 | 方案 C (PICO Link) |
-
-### 方案 A vs 方案 D 详细对比
-
-| 对比项 | 方案 A (Remote Vision) | 方案 D (修改 Unity Client) |
-|--------|------------------------|---------------------------|
-| **视频传输** | XRoboToolkit-Robot-Vision | 你的 server.py + WebSocket |
-| **改动位置** | PC 端 (适配 Robot-Vision) | 头显端 (Unity Client) |
-| **官方支持** | ✅ 官方模块 | ❌ 需要自己维护 |
-| **你的 server.py** | 替换掉 | ✅ 保留 |
-| **相机兼容性** | ZED Mini 等已支持 | ✅ 任意相机 |
-| **开发工作量** | 小 (如果相机兼容) | 中 (需要写 Unity 代码) |
-| **灵活性** | 受限于 Robot-Vision | ✅ 完全自定义 |
-
-**建议决策流程**：
-
-```
-你的立体相机是 ZED Mini 吗？
-    ├─ 是 → 方案 A (直接用 Remote Vision)
-    │
-    └─ 否 → 你的相机可以适配 Robot-Vision 吗？
-              ├─ 可以 → 方案 A (写适配器)
-              │
-              └─ 不行/太麻烦 → 方案 D (改 Unity Client)
-```
-
----
-
-# XRoboToolkit 完整仓库地图
-
-## 官方资源入口
-
-| 资源 | 链接 | 说明 |
-|------|------|------|
-| **GitHub组织** | https://github.com/XR-Robotics | 所有仓库汇总 |
-| **官方文档** | https://xr-robotics.github.io/ | 框架介绍和API文档 |
-| **YouTube** | @XRRobotics | 演示视频 |
-| **Discord** | 官网获取 | 技术支持社区 |
-
----
-
-## 仓库全景图 (按安装顺序)
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                        XRoboToolkit 仓库依赖关系                                 │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │ 第1层: PICO头显端 (必装)                                                 │   │
-│  │                                                                          │   │
-│  │  ┌────────────────────────────────────────────────────────────────┐     │   │
-│  │  │ XRoboToolkit-Unity-Client                                      │     │   │
-│  │  │ https://github.com/XR-Robotics/XRoboToolkit-Unity-Client       │     │   │
-│  │  │                                                                 │     │   │
-│  │  │ ⭐ 30 stars | 语言: C#/Unity                                   │     │   │
-│  │  │ 功能: 采集头部/手柄/手势/全身追踪数据                            │     │   │
-│  │  │ 输出: APK安装包 (需自行编译或找Release)                         │     │   │
-│  │  │ 支持: PICO 4 Ultra (推荐) / PICO 4 Pro / PICO 4                │     │   │
-│  │  └────────────────────────────────────────────────────────────────┘     │   │
-│  │                                                                          │   │
-│  │  ┌────────────────────────────────────────────────────────────────┐     │   │
-│  │  │ XRoboToolkit-Unity-Client-Quest (备选)                         │     │   │
-│  │  │ https://github.com/XR-Robotics/XRoboToolkit-Unity-Client-Quest │     │   │
-│  │  │ ⭐ 18 stars | 支持: Meta Quest 3/Pro                           │     │   │
-│  │  └────────────────────────────────────────────────────────────────┘     │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-│                                      │                                          │
-│                                      ▼ WiFi/USB传输                             │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │ 第2层: PC服务端 (必装)                                                   │   │
-│  │                                                                          │   │
-│  │  ┌────────────────────────────────────────────────────────────────┐     │   │
-│  │  │ XRoboToolkit-PC-Service                                        │     │   │
-│  │  │ https://github.com/XR-Robotics/XRoboToolkit-PC-Service         │     │   │
-│  │  │                                                                 │     │   │
-│  │  │ ⭐ 19 stars | 语言: C++/Qt6 | 许可: Apache 2.0                 │     │   │
-│  │  │                                                                 │     │   │
-│  │  │ 功能:                                                          │     │   │
-│  │  │ - gRPC服务器接收PICO数据                                        │     │   │
-│  │  │ - 设备管理和数据记录                                            │     │   │
-│  │  │ - 低延迟视频流 (<100ms)                                         │     │   │
-│  │  │                                                                 │     │   │
-│  │  │ 支持平台:                                                       │     │   │
-│  │  │ - Windows x64                                                   │     │   │
-│  │  │ - Linux x86_64 (Ubuntu 22.04)                                  │     │   │
-│  │  │ - Linux ARM64 (Jetson/Orin)                                    │     │   │
-│  │  │                                                                 │     │   │
-│  │  │ 安装: sudo dpkg -i xrobotoolkit-pc-service_xxx.deb             │     │   │
-│  │  └────────────────────────────────────────────────────────────────┘     │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-│                                      │                                          │
-│                                      ▼ 本地API调用                              │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │ 第3层: 语言绑定 (选一个)                                                 │   │
-│  │                                                                          │   │
-│  │  ┌────────────────────────────────────────────────────────────────┐     │   │
-│  │  │ XRoboToolkit-PC-Service-Pybind  ← 推荐！                       │     │   │
-│  │  │ https://github.com/XR-Robotics/XRoboToolkit-PC-Service-Pybind  │     │   │
-│  │  │                                                                 │     │   │
-│  │  │ ⭐ 5 stars | 语言: Python | 最新版: v1.0.2                     │     │   │
-│  │  │                                                                 │     │   │
-│  │  │ 核心API:                                                        │     │   │
-│  │  │ - xrt.init() / xrt.close()                                     │     │   │
-│  │  │ - xrt.get_headset_pose()                                       │     │   │
-│  │  │ - xrt.get_left/right_controller_pose()                         │     │   │
-│  │  │ - xrt.is_body_data_available()                                 │     │   │
-│  │  │ - xrt.get_body_joint_poses() → 24个关节                        │     │   │
-│  │  │                                                                 │     │   │
-│  │  │ 安装:                                                          │     │   │
-│  │  │ conda create -n xr python=3.10                                 │     │   │
-│  │  │ pip install .                                                   │     │   │
-│  │  └────────────────────────────────────────────────────────────────┘     │   │
-│  │                                                                          │   │
-│  │  ┌────────────────────────────────────────────────────────────────┐     │   │
-│  │  │ XRoboToolkit-Teleop-ROS (ROS2用户)                             │     │   │
-│  │  │ https://github.com/XR-Robotics/XRoboToolkit-Teleop-ROS         │     │   │
-│  │  │                                                                 │     │   │
-│  │  │ ⭐ 7 stars | 语言: C++ | 支持: ROS1 & ROS2                     │     │   │
-│  │  │                                                                 │     │   │
-│  │  │ 发布话题:                                                       │     │   │
-│  │  │ - /xr/head (float32[7] pose)                                   │     │   │
-│  │  │ - /xr/left_controller                                          │     │   │
-│  │  │ - /xr/right_controller                                         │     │   │
-│  │  │                                                                 │     │   │
-│  │  │ 运行: ros2 run picoxr talker                                   │     │   │
-│  │  └────────────────────────────────────────────────────────────────┘     │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-│                                      │                                          │
-│                                      ▼ 应用开发                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │ 第4层: 示例和应用 (参考学习)                                             │   │
-│  │                                                                          │   │
-│  │  ┌────────────────────────────────────────────────────────────────┐     │   │
-│  │  │ XRoboToolkit-Teleop-Sample-Python                              │     │   │
-│  │  │ https://github.com/XR-Robotics/XRoboToolkit-Teleop-Sample-Python│     │   │
-│  │  │                                                                 │     │   │
-│  │  │ ⭐ 61 stars | 最受欢迎的示例仓库                                │     │   │
-│  │  │                                                                 │     │   │
-│  │  │ 仿真示例:                                                       │     │   │
-│  │  │ - teleop_dual_ur5e_mujoco.py (UR5e双臂)                        │     │   │
-│  │  │ - teleop_shadow_hand_mujoco.py (Shadow灵巧手)                  │     │   │
-│  │  │ - teleop_x7s_placo.py (Placo可视化)                            │     │   │
-│  │  │                                                                 │     │   │
-│  │  │ 真机示例:                                                       │     │   │
-│  │  │ - teleop_dual_ur5e_hardware.py                                 │     │   │
-│  │  │ - teleop_dual_arx_r5_hardware.py                               │     │   │
-│  │  │ - teleop_r1lite_hardware.py (Galaxea人形机器人)                │     │   │
-│  │  └────────────────────────────────────────────────────────────────┘     │   │
-│  │                                                                          │   │
-│  │  ┌────────────────────────────────────────────────────────────────┐     │   │
-│  │  │ XRoboToolkit-Teleop-Sample-Cpp                                 │     │   │
-│  │  │ https://github.com/XR-Robotics/XRoboToolkit-Teleop-Sample-Cpp  │     │   │
-│  │  │ C++版双臂机器人遥操作示例                                       │     │   │
-│  │  └────────────────────────────────────────────────────────────────┘     │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 你需要什么设备？
-
-| 设备 | 价格 | 必须？ | 说明 |
-|------|------|--------|------|
-| PICO 4 / 4 Pro / 4 Ultra | ¥2000-4000 | ✅ 是 | **消费版就够用**，不需要企业版 |
-| PICO Motion Tracker (2个) | ¥500 | ❌ 可选 | 绑在脚踝，提高腿部追踪精度 |
-| Linux电脑 (Ubuntu 22.04) | - | ✅ 是 | 运行服务程序 |
-
-**重要**: 消费版PICO 4完全支持体感追踪，不需要花更多钱买企业版！
-
----
-
-## 方案对比：哪个适合你？
-
-```
-简单程度: XRoboToolkit > ALVR > Unity方案
-推荐指数: ⭐⭐⭐⭐⭐   ⭐⭐⭐    ⭐⭐
-```
-
-| 方案 | 延迟 | 难度 | Linux | ROS2 | 适合谁 |
-|------|------|------|-------|------|--------|
-| **XRoboToolkit** | 20ms | 简单 | ✅ | ✅ | 机器人研究、你的项目 |
-| ALVR | 30-50ms | 中等 | ✅ | ❌ | VR游戏玩家 |
-| Unity | 30ms | 复杂 | ❌ | 部分 | Windows快速原型 |
-
-**推荐: XRoboToolkit** - PICO官方出品，专为机器人设计
-
----
-
-## XRoboToolkit 是什么？
-
-简单说：**PICO官方做的一套工具，让你能在Linux电脑上获取VR头显的追踪数据**
-
-```
-数据流动过程：
-
-  [PICO头显]                    [Linux电脑]                    [浏览器]
-      |                              |                              |
-   戴在头上                     运行服务程序                    显示骨骼
-   追踪身体                     接收追踪数据                    渲染画面
-      |                              |                              |
-      +-------- WiFi传输 ----------->+-------- WebSocket ---------->+
-                                     |
-                              (你的server.py)
-```
-
----
-
-## 能获取哪些数据？
-
-XRoboToolkit 可以给你 **5种追踪数据**：
-
-| 数据类型 | 内容 | 帧率 |
-|----------|------|------|
-| 头部 | 位置 + 朝向 (6自由度) | 90Hz |
-| 手柄 | 位置 + 按钮 + 摇杆 | 90Hz |
-| 手势 | 26个手指关节 | 60Hz |
-| **全身** | **24个骨骼关节** | 90Hz |
-| 追踪器 | Motion Tracker位置 | 200Hz |
-
-**24个骨骼关节包括**：
-- 头、颈、胸、腰、骨盆
-- 左右肩、上臂、前臂、手
-- 左右大腿、小腿、脚
-
----
-
-## 安装步骤 (5分钟)
-
-### 第1步：PICO头显端
-
-```bash
-# 1. 开启开发者模式
-#    设置 → 通用 → 开发者模式 → 开启
-
-# 2. 用数据线连接电脑，安装APP
-adb install XRoboToolkit-PICO-1.1.1.apk
-```
-
-### 第2步：Linux电脑端
-
-```bash
-# 方法A：直接安装预编译包 (推荐)
-wget https://github.com/XR-Robotics/XRoboToolkit-PC-Service/releases/download/v1.1.1/xrobotoolkit-pc-service_1.1.1_amd64.deb
-sudo dpkg -i xrobotoolkit-pc-service_1.1.1_amd64.deb
-
-# 方法B：从源码编译
-git clone https://github.com/XR-Robotics/XRoboToolkit-PC-Service.git
-cd XRoboToolkit-PC-Service
-./build_linux.sh
-```
-
-### 第3步：安装Python绑定
-
-```bash
-# 克隆并编译Python绑定
-git clone https://github.com/XR-Robotics/XRoboToolkit-PC-Service-Pybind.git
-cd XRoboToolkit-PC-Service-Pybind
-pip install .
-```
-
-### 第4步：测试连接
-
-```python
-# test_tracking.py
-import pxrea
-
-def on_data(data_type, data):
-    if data_type == 0x08:  # 全身追踪
-        print(f"收到骨骼数据: {len(data['joints'])}个关节")
-
-# 启动
-pxrea.PXREAInit(None, on_data, 0xFF)
-input("按回车退出...")
-pxrea.PXREADeinit()
-```
-
----
-
-## 与你的项目集成
-
-### 架构图
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│  PICO 头显                                                      │
-│  ┌──────────────────────┐  ┌────────────────────────────────┐  │
-│  │ XRoboToolkit APP     │  │ 浏览器 (你的VR Viewer)          │  │
-│  │ 采集追踪数据          │  │ 显示相机画面 + 骨骼             │  │
-│  └──────────┬───────────┘  └─────────────────┬──────────────┘  │
-└─────────────┼────────────────────────────────┼─────────────────┘
-              │ WiFi                            │ WebSocket
-┌─────────────┼────────────────────────────────┼─────────────────┐
-│  Linux 电脑 │                                │                 │
-│  ┌──────────▼───────────┐  ┌─────────────────▼──────────────┐  │
-│  │ XRoboToolkit服务     │  │ 你的 server.py                 │  │
-│  │ (C++后台运行)        │  │ - USB相机流 (已有)             │  │
-│  └──────────┬───────────┘  │ - 追踪数据 (新增)              │  │
-│             │               │ - WebSocket发送                │  │
-│  ┌──────────▼───────────┐  │                                │  │
-│  │ Python绑定 (pxrea)   │──┘                                │  │
-│  └──────────────────────┘                                    │  │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### 修改你的 server.py
-
-在现有代码基础上，添加追踪数据接收：
-
-```python
-# === 新增：体感追踪模块 ===
-
-import threading
-from typing import Optional, Dict, Any
-
-# 尝试导入XRoboToolkit
-try:
-    import pxrea
-    HAS_TRACKING = True
-except ImportError:
-    HAS_TRACKING = False
-    print("[提示] 未安装pxrea，体感追踪功能不可用")
-
-
-class BodyTracker:
-    """体感追踪数据接收器"""
-
-    def __init__(self):
-        self.data = None
-        self.lock = threading.Lock()
-        self.frame_id = 0
-
-    def _callback(self, data_type: int, data: dict):
-        """接收追踪数据的回调函数"""
-        with self.lock:
-            if data_type == 0x08:  # BODY = 全身追踪
-                self.data = data
-                self.frame_id += 1
-
-    def start(self):
-        """启动追踪"""
-        if not HAS_TRACKING:
-            return False
-
-        result = pxrea.PXREAInit(None, self._callback, 0x08)
-        return result == 0
-
-    def get_frame(self) -> Optional[dict]:
-        """获取最新一帧追踪数据"""
-        with self.lock:
-            if self.data is None:
-                return None
-
-            return {
-                'type': 'body_tracking',
-                'frame_id': self.frame_id,
-                'joints': self._format_joints(self.data.get('joints', []))
-            }
-
-    def _format_joints(self, joints: list) -> dict:
-        """把关节数组转成字典，方便前端使用"""
-        names = [
-            'Pelvis', 'SpineLower', 'SpineMiddle', 'SpineUpper',
-            'Chest', 'Neck', 'Head',
-            'LeftShoulder', 'LeftUpperArm', 'LeftLowerArm', 'LeftHand',
-            'RightShoulder', 'RightUpperArm', 'RightLowerArm', 'RightHand',
-            'LeftUpperLeg', 'LeftLowerLeg', 'LeftFoot',
-            'RightUpperLeg', 'RightLowerLeg', 'RightFoot'
-        ]
-
-        result = {}
-        for i, joint in enumerate(joints):
-            if i < len(names):
-                result[names[i]] = {
-                    'pos': joint.get('position', [0, 0, 0]),
-                    'rot': joint.get('rotation', [0, 0, 0, 1])
-                }
-        return result
-
-    def stop(self):
-        if HAS_TRACKING:
-            pxrea.PXREADeinit()
-
-
-# === 在你的WebSocket服务器中使用 ===
-
-class USBStereoWebSocketServerSSL:
-    def __init__(self, ...):
-        # ... 现有代码 ...
-
-        # 新增：体感追踪
-        self.tracker = BodyTracker()
-
-    async def start_server(self):
-        # ... 现有代码 ...
-
-        # 新增：启动追踪
-        if self.tracker.start():
-            print("[OK] 体感追踪已启动")
-
-    async def handle_client(self, websocket):
-        while True:
-            # 1. 发送相机帧 (现有)
-            camera_frame = self.get_camera_frame()
-            if camera_frame:
-                await websocket.send(json.dumps(camera_frame))
-
-            # 2. 发送追踪数据 (新增)
-            body_frame = self.tracker.get_frame()
-            if body_frame:
-                await websocket.send(json.dumps(body_frame))
-
-            await asyncio.sleep(1/60)
-```
-
-### 前端接收数据
-
-```javascript
-// 在你的 dual_infrared_vr_viewer.html 中
-
-ws.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-
-    if (data.type === 'dual_infrared_frame') {
-        // 现有：处理相机帧
-        updateCameraView(data);
-    }
-    else if (data.type === 'body_tracking') {
-        // 新增：处理骨骼数据
-        updateSkeleton(data.joints);
-    }
-};
-
-function updateSkeleton(joints) {
-    // 示例：打印头部位置
-    if (joints.Head) {
-        console.log('头部位置:', joints.Head.pos);
-    }
-
-    // TODO: 用Three.js渲染骨骼
+    FallBack "Diffuse"
 }
 ```
 
 ---
 
-## ROS2 集成 (可选)
+## 2.6 Unity 场景设置
 
-如果你需要接入机器人系统：
+### 步骤 1: 创建显示平面
 
-```bash
-# 1. 克隆ROS2包
-cd ~/ros2_ws/src
-git clone https://github.com/XR-Robotics/XRoboToolkit-Teleop-ROS.git
+1. 在 Hierarchy 中右键 → `3D Object` → `Quad`
+2. 重命名为 `StereoDisplayQuad`
+3. 设置 Transform:
+   - Position: (0, 0, 2) — 放在相机前方 2 米
+   - Rotation: (0, 180, 0) — 面向相机
+   - Scale: (3.2, 1.8, 1) — 16:9 比例
 
-# 2. 编译
-cd ~/ros2_ws
-colcon build --packages-select picoxr xr_msgs
+### 步骤 2: 创建材质
 
-# 3. 运行
-source install/setup.bash
-ros2 run picoxr talker
+1. 在 Project 窗口右键 → `Create` → `Material`
+2. 重命名为 `StereoDisplayMaterial`
+3. 选择 Shader: `Custom/StereoDisplay`
+4. 将材质拖到 `StereoDisplayQuad` 上
 
-# 4. 查看数据
-ros2 topic echo /xr/body_tracking
-```
+### 步骤 3: 挂载脚本
 
-**发布的ROS2话题**：
-- `/xr/head` - 头部位姿
-- `/xr/left_controller` - 左手柄
-- `/xr/right_controller` - 右手柄
-- `/xr/body_tracking` - 全身骨骼
+1. 选择场景中的某个 GameObject (如 Main Camera 或新建空对象)
+2. `Add Component` → 搜索 `StereoVisionReceiver`
+3. 配置参数:
+   - Server IP: 你的 PC IP 地址
+   - Server Port: 8765
+   - Left Eye Material: 拖入 StereoDisplayMaterial
+   - Right Eye Material: 拖入 StereoDisplayMaterial
+   - Display Quad: 拖入 StereoDisplayQuad
+
+### 步骤 4: 配置 XR 设置
+
+1. `Edit` → `Project Settings` → `XR Plug-in Management`
+2. 勾选 `PICO`
+3. 确保 Single Pass Instanced 渲染模式启用
 
 ---
 
-## 数据格式参考
+## 2.7 打包 APK
 
-### WebSocket消息格式
+```
+1. File → Build Settings
+2. 选择 Android 平台
+3. 点击 Switch Platform
+4. Player Settings:
+   - Company Name: 你的名字
+   - Product Name: StereoVR
+   - Minimum API Level: Android 10.0 (API 29)
+   - Target API Level: Android 12 (API 31)
+5. 点击 Build
+6. 选择保存位置，生成 APK
+```
+
+---
+
+## 2.8 安装到 PICO
+
+```bash
+# 1. 连接 PICO (USB 数据线)
+# 2. PICO 上选择 "传输文件"
+
+# 3. 检查设备连接
+adb devices
+
+# 4. 安装 APK
+adb install -r StereoVR.apk
+
+# 5. 查看安装的应用
+adb shell pm list packages | grep stereo
+```
+
+---
+
+# 第三部分：系统集成测试
+
+## 3.1 启动顺序
+
+```bash
+# === PC 端 ===
+
+# 终端 1: 启动 PC-Service
+xrobotoolkit-pc-service
+
+# 终端 2: 启动你的 server.py
+conda activate xrobot
+python server.py
+
+
+# === PICO 端 ===
+
+# 1. 确保 PICO 和 PC 在同一 WiFi 网络
+# 2. 打开 "StereoVR" 应用
+# 3. 在应用中输入 PC 的 IP 地址
+# 4. 点击连接
+```
+
+## 3.2 验证清单
+
+| 检查项 | 预期结果 |
+|--------|----------|
+| PC-Service 运行 | `ps aux \| grep xrobotoolkit` 有输出 |
+| server.py 运行 | 显示 "WebSocket 服务器启动" |
+| PICO 显示画面 | 看到双目相机的立体图像 |
+| 追踪数据 | server.py 终端显示 "收到追踪数据" |
+
+## 3.3 网络调试
+
+```bash
+# 查看 PC IP 地址
+ip addr show | grep inet
+
+# 测试 WebSocket 端口
+nc -zv <PC_IP> 8765
+
+# 查看 PICO 连接状态
+adb logcat | grep StereoVision
+```
+
+---
+
+# 第四部分：数据格式参考
+
+## 追踪数据 JSON 格式
 
 ```json
 {
     "type": "body_tracking",
     "frame_id": 42,
+    "timestamp": 1704326400000,
     "joints": {
         "Head": {
-            "pos": [0.0, 1.7, 0.0],
-            "rot": [0.0, 0.0, 0.0, 1.0]
+            "position": [0.0, 1.7, 0.0],
+            "rotation": [0.0, 0.0, 0.0, 1.0]
         },
         "Neck": {
-            "pos": [0.0, 1.55, 0.0],
-            "rot": [0.0, 0.0, 0.0, 1.0]
+            "position": [0.0, 1.55, 0.0],
+            "rotation": [0.0, 0.0, 0.0, 1.0]
         },
         "LeftHand": {
-            "pos": [-0.3, 1.2, 0.3],
-            "rot": [0.0, 0.0, 0.0, 1.0]
+            "position": [-0.3, 1.2, 0.3],
+            "rotation": [0.0, 0.0, 0.0, 1.0]
         }
-        // ... 其他21个关节
+        // ... 24 个关节
+    },
+    "head": {
+        "position": [0.0, 1.7, 0.0],
+        "rotation": [0.0, 0.0, 0.0, 1.0]
+    },
+    "controllers": {
+        "left": { "position": [...], "rotation": [...], "buttons": {...} },
+        "right": { "position": [...], "rotation": [...], "buttons": {...} }
     }
 }
 ```
 
-### 坐标系说明
+## 视频帧二进制格式
+
+```
+[4 字节: 左图 JPEG 大小 (little-endian uint32)]
+[N 字节: 左图 JPEG 数据]
+[4 字节: 右图 JPEG 大小 (little-endian uint32)]
+[M 字节: 右图 JPEG 数据]
+```
+
+## 坐标系
 
 ```
       Y (上)
@@ -919,137 +976,43 @@ ros2 topic echo /xr/body_tracking
    Z (前)
 
 - 右手坐标系
-- 单位：米
-- 旋转：四元数 [x, y, z, w]
-- 原点：启动时头部位置
+- 单位: 米
+- 旋转: 四元数 [x, y, z, w]
+- 原点: 启动时头部位置
 ```
 
 ---
+
+# 第五部分：参考资源
+
+## 官方仓库
+
+| 仓库 | 链接 | 说明 |
+|------|------|------|
+| Unity Client | https://github.com/XR-Robotics/XRoboToolkit-Unity-Client | PICO 端应用 |
+| PC-Service | https://github.com/XR-Robotics/XRoboToolkit-PC-Service | PC 后台服务 |
+| Python 绑定 | https://github.com/XR-Robotics/XRoboToolkit-PC-Service-Pybind | pxrea API |
+| 官方文档 | https://xr-robotics.github.io/ | 框架文档 |
+
+## 设备要求
+
+| 设备 | 要求 |
+|------|------|
+| PICO 头显 | PICO 4 / 4 Pro / 4 Ultra (消费版即可) |
+| PC | Ubuntu 22.04, x86_64 |
+| 双目相机 | 任意 OpenCV 兼容的 USB 双目相机 |
+| 网络 | PICO 和 PC 在同一局域网 |
 
 ## 常见问题
 
-### Q: 消费版PICO能用吗？
-**A: 能！** PICO 4、4 Pro、4 Ultra都支持，不需要企业版。
+**Q: 消费版 PICO 能用吗？**
+A: 能！PICO 4、4 Pro、4 Ultra 消费版都支持体感追踪。
 
-### Q: 必须买Motion Tracker吗？
-**A: 不必须。** 没有Tracker也能追踪全身，只是腿部精度稍低。
+**Q: 必须买 Motion Tracker 吗？**
+A: 不必须。没有 Tracker 也能追踪全身，只是腿部精度稍低。
 
-### Q: 延迟有多少？
-**A: 约20ms。** 从身体动作到数据到达电脑约20毫秒。
+**Q: 延迟有多少？**
+A: 追踪约 20ms，视频取决于网络，通常 50-100ms。
 
-### Q: 支持Windows吗？
-**A: 支持。** XRoboToolkit同时支持Windows和Linux。
-
-### Q: pxrea是什么意思？
-**A: PICO XR Enterprise Assistant** 的缩写，是XRoboToolkit的核心API。
-
----
-
-## 后续开发计划
-
-### 阶段1：基础集成 (1周)
-- [ ] 安装XRoboToolkit环境
-- [ ] 测试追踪数据接收
-- [ ] 修改server.py添加追踪模块
-- [ ] 验证WebSocket数据传输
-
-### 阶段2：前端渲染 (1周)
-- [ ] Three.js骨骼可视化
-- [ ] 坐标系对齐调试
-- [ ] 与相机画面叠加显示
-
-### 阶段3：ROS2集成 (可选)
-- [ ] 编译ROS2节点
-- [ ] 订阅追踪话题
-- [ ] 对接机器人控制
-
----
-
-## 参考链接
-
-### 官方资源
-- [XRoboToolkit GitHub](https://github.com/XR-Robotics)
-- [XRoboToolkit 论文](https://arxiv.org/html/2508.00097)
-- [PICO开发者中心](https://developer-cn.picoxr.com/)
-
-### SDK文档
-- [PICO Integration SDK 3.0](https://developer-cn.picoxr.com/document/)
-- [XR_BD_body_tracking OpenXR扩展](https://registry.khronos.org/OpenXR/specs/1.1/man/html/XR_BD_body_tracking.html)
-
-### 相关项目
-- [TWIST2 人形机器人遥操作](https://github.com/amazon-far/TWIST2) - 使用相同的XRoboToolkit
-- [ALVR](https://github.com/alvr-org/ALVR) - 备选方案
-
----
-
-## SDK生态系统图
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          PICO SDK 生态系统                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                     你的应用层                                   │   │
-│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐  │   │
-│  │  │ VR游戏          │  │ 机器人遥操作    │  │ 你的WebXR项目   │  │   │
-│  │  └─────────────────┘  └─────────────────┘  └─────────────────┘  │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                               ↑                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    框架层 (选一个)                               │   │
-│  │                                                                   │   │
-│  │  ┌─────────────────────────────────────────────────────────┐    │   │
-│  │  │ XRoboToolkit ← 推荐！                                    │    │   │
-│  │  │ github.com/XR-Robotics                                   │    │   │
-│  │  │ - 轻量级C++服务                                          │    │   │
-│  │  │ - Python绑定 (pxrea)                                     │    │   │
-│  │  │ - ROS2支持                                               │    │   │
-│  │  └─────────────────────────────────────────────────────────┘    │   │
-│  │                           或                                     │   │
-│  │  ┌─────────────────────────────────────────────────────────┐    │   │
-│  │  │ Unity/Unreal SDK                                         │    │   │
-│  │  │ github.com/Pico-Developer                                │    │   │
-│  │  │ - 游戏引擎集成                                           │    │   │
-│  │  │ - 更重但功能更全                                         │    │   │
-│  │  └─────────────────────────────────────────────────────────┘    │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                               ↑                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    底层 SDK                                      │   │
-│  │  PICO Integration SDK 3.0                                        │   │
-│  │  - Unity SDK / Unreal SDK / OpenXR SDK / Native SDK              │   │
-│  │  - 体感追踪、手势、MR、空间音频等功能                             │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                               ↑                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    设备运行时                                    │   │
-│  │  PICO OpenXR Runtime (运行在头显上)                              │   │
-│  │  - XR_BD_body_tracking 扩展                                      │   │
-│  │  - XR_PICO_hand_tracking 扩展                                    │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                               ↑                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    硬件层                                        │   │
-│  │  PICO 4 / 4 Pro / 4 Ultra + Motion Tracker (可选)                │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────┘
-
-GitHub组织对比：
-┌──────────────────┬──────────────────────┬─────────────────────────┐
-│ github.com/      │ 定位                  │ 主要内容                │
-├──────────────────┼──────────────────────┼─────────────────────────┤
-│ Pico-Developer   │ 官方SDK              │ Unity/Unreal/OpenXR SDK │
-│ picoxr           │ 社区支持             │ 示例代码、技术支持       │
-│ XR-Robotics      │ 机器人专用           │ XRoboToolkit全套        │
-└──────────────────┴──────────────────────┴─────────────────────────┘
-```
-
----
-
-## 总结
-
-1. **用XRoboToolkit** - PICO官方出品，简单好用
-2. **消费版够用** - 不需要买企业版设备
-3. **改动量小** - 只需在server.py添加一个模块
-4. **ROS2友好** - 天然支持机器人系统集成
+**Q: pxrea 是什么意思？**
+A: PICO XR Enterprise Assistant 的缩写。
