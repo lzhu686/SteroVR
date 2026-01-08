@@ -528,12 +528,22 @@ class SimpleH264Sender:
 
         try:
             logger.info(f"启动 FFmpeg 编码器...")
+            logger.info(f"FFmpeg 命令: {' '.join(ffmpeg_cmd)}")
             self.ffmpeg_process = subprocess.Popen(
                 ffmpeg_cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.PIPE  # 捕获错误输出以便调试
             )
+
+            # 启动一个线程来读取 stderr
+            def log_stderr():
+                for line in self.ffmpeg_process.stderr:
+                    logger.warning(f"[FFmpeg] {line.decode('utf-8', errors='ignore').strip()}")
+
+            import threading
+            stderr_thread = threading.Thread(target=log_stderr, daemon=True)
+            stderr_thread.start()
         except Exception as e:
             logger.error(f"启动 FFmpeg 失败: {e}")
             self.tcp_socket.close()
