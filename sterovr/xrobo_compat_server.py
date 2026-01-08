@@ -124,20 +124,37 @@ class PacketParser:
     def _try_parse_network_data_protocol(data: bytes) -> tuple:
         """
         解析 NetworkDataProtocol 格式
-        格式: [cmd_len:4bytes][command:string][data_len:4bytes][data:bytes]
+
+        Unity Client 发送格式:
+        [total_length: 4 bytes Big-Endian][cmd_len: 4 bytes Little-Endian][command][data_len: 4 bytes Little-Endian][data]
+
+        例如 OPEN_CAMERA:
+        00 00 00 43  - total length (67 bytes, Big-Endian)
+        0b 00 00 00  - cmd_len (11, Little-Endian)
+        4f 50 45 4e 5f 43 41 4d 45 52 41  - "OPEN_CAMERA"
+        30 00 00 00  - data_len (48 bytes, Little-Endian)
+        ca fe 01 ... - CameraRequest data
         """
         try:
             # 打印收到的原始数据前64字节（用于调试）
             hex_preview = data[:min(64, len(data))].hex()
             logger.info(f"[DEBUG] 收到数据 ({len(data)} bytes): {hex_preview}...")
 
-            if len(data) < 8:
-                logger.debug(f"[DEBUG] 数据太短: {len(data)} < 8")
+            if len(data) < 12:
+                logger.debug(f"[DEBUG] 数据太短: {len(data)} < 12")
                 return None, None
 
             offset = 0
 
-            # 读取命令长度
+            # 检查是否有 Big-Endian 长度前缀
+            # 如果前4字节作为 Big-Endian 是合理的长度值，则跳过它
+            potential_total_len = struct.unpack('>I', data[0:4])[0]
+            if 10 < potential_total_len < 1000 and potential_total_len <= len(data):
+                # 有总长度前缀，跳过它
+                offset = 4
+                logger.info(f"[DEBUG] 检测到长度前缀: {potential_total_len} bytes")
+
+            # 读取命令长度 (Little-Endian)
             cmd_len = struct.unpack('<I', data[offset:offset+4])[0]
             offset += 4
             logger.info(f"[DEBUG] cmd_len = {cmd_len}")
