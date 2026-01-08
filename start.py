@@ -25,6 +25,9 @@ import subprocess
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
+# 添加当前目录到路径
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 HTTPS_PORT = 8445
 WSS_PORT = 8765
 
@@ -64,6 +67,7 @@ def setup_adb_reverse():
 def start_https_server():
     """启动 HTTPS 文件服务器"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    web_dir = os.path.join(script_dir, "web")
     cert_file = os.path.join(script_dir, "server.crt")
     key_file = os.path.join(script_dir, "server.key")
 
@@ -76,7 +80,7 @@ def start_https_server():
             '-subj', '/CN=localhost'
         ], capture_output=True)
 
-    os.chdir(script_dir)
+    os.chdir(web_dir)
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_context.load_cert_chain(cert_file, key_file)
 
@@ -87,7 +91,7 @@ def start_https_server():
 
 async def start_websocket_server():
     """启动 WSS WebSocket 服务器"""
-    from server import USBStereoWebSocketServerSSL
+    from sterovr.server import USBStereoWebSocketServerSSL
     server = USBStereoWebSocketServerSSL(host="0.0.0.0", port=WSS_PORT, use_ssl=True)
     try:
         await server.start_server()

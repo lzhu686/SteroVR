@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 H.264 视频编码发送器模块
-基于 SteroVR 的 USB 双目相机模块，输出 H.264 编码的 UDP 视频流
+基于 StereoVR 的 USB 双目相机模块，输出 H.264 编码的 UDP 视频流
 兼容 XRoboToolkit Unity Client 的 MediaDecoder
 
 功能特性:
-1. 复用 SteroVR 的相机采集逻辑
+1. 复用 StereoVR 的相机采集逻辑
 2. 使用 GStreamer 进行硬件加速 H.264 编码
 3. 通过 UDP 发送 RTP 封装的视频流
 4. 完全兼容 XRoboToolkit-Orin-Video-Sender 协议
@@ -69,7 +69,7 @@ class VideoConfig:
 class StereoCamera:
     """
     立体相机采集类
-    复用 SteroVR server.py 的相机采集逻辑
+    复用 StereoVR server.py 的相机采集逻辑
     """
 
     def __init__(self, config: VideoConfig, device_id: int = 0):

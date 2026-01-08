@@ -35,7 +35,7 @@ from typing import Optional, Callable
 from dataclasses import dataclass
 
 # 导入 H.264 发送器
-from h264_sender import SimpleH264Sender, VideoConfig
+from .h264_sender import SimpleH264Sender, VideoConfig
 
 # 配置日志
 logging.basicConfig(
@@ -418,7 +418,7 @@ class XRoboCompatServer:
                     {
                         "name": "USB_STEREO",
                         "type": "USB",
-                        "description": "USB Stereo Camera (SteroVR)"
+                        "description": "USB Stereo Camera (StereoVR)"
                     }
                 ]
             }
@@ -485,7 +485,7 @@ def get_local_ip() -> str:
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
-        description='XRoboToolkit 协议兼容服务器 - 让 PICO 头显接收 SteroVR 视频流'
+        description='XRoboToolkit 协议兼容服务器 - 让 PICO 头显接收 StereoVR 视频流'
     )
     parser.add_argument(
         '--device', '-d',
@@ -505,7 +505,7 @@ def main():
     local_ip = get_local_ip()
     print()
     print("=" * 60)
-    print("SteroVR → XRoboToolkit 兼容服务器")
+    print("StereoVR → XRoboToolkit 兼容服务器")
     print("=" * 60)
     print(f"本机 IP: {local_ip}")
     print(f"请在 PICO 头显的 Unity Client 中输入此 IP")

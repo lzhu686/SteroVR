@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SteroVR 统一启动脚本
+StereoVR 统一启动脚本
 一键启动 XRoboToolkit 兼容服务器
 
 功能:
@@ -118,7 +118,7 @@ def print_status(text: str, ok: bool):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='SteroVR XRoboToolkit 兼容服务器启动脚本'
+        description='StereoVR XRoboToolkit 兼容服务器启动脚本'
     )
     parser.add_argument('--device', '-d', type=int, default=0,
                         help='相机设备 ID (默认: 0)')
@@ -209,7 +209,7 @@ def main():
     print()
 
     try:
-        from xrobo_compat_server import XRoboCompatServer
+        from sterovr.xrobo_compat_server import XRoboCompatServer
         server = XRoboCompatServer(device_id=args.device)
         server.start()
     except KeyboardInterrupt:
