@@ -92,11 +92,10 @@ class CameraRequest:
 
 class PacketParser:
     """
-    XRoboToolkit 协议包解析器
-    参考: XRoboToolkit-Unity-Client/Assets/Scripts/Network/PackageHandle.cs
-
-    包结构:
-    [Head:1] [Cmd:1] [Length:4] [Data:n] [Timestamp:8] [End:1]
+    协议包解析器
+    支持两种格式:
+    1. XRoboToolkit 格式: [Head:1][Cmd:1][Length:4][Data:n][Timestamp:8][End:1]
+    2. NetworkDataProtocol 格式: [cmd_len:4][command:str][data_len:4][data:bytes]
     """
 
     @staticmethod
@@ -105,9 +104,167 @@ class PacketParser:
         解析数据包
         返回: (command, json_data) 或 (None, None)
         """
-        if len(data) < 15:  # 最小包长度
+        if len(data) < 8:
             return None, None
 
+        # 首先尝试 NetworkDataProtocol 格式 (Unity Client 使用)
+        result = PacketParser._try_parse_network_data_protocol(data)
+        if result[0] is not None:
+            return result
+
+        # 然后尝试 XRoboToolkit 格式
+        result = PacketParser._try_parse_xrobo_protocol(data)
+        if result[0] is not None:
+            return result
+
+        # 最后尝试直接解析 JSON
+        return PacketParser._try_parse_json(data)
+
+    @staticmethod
+    def _try_parse_network_data_protocol(data: bytes) -> tuple:
+        """
+        解析 NetworkDataProtocol 格式
+        格式: [cmd_len:4bytes][command:string][data_len:4bytes][data:bytes]
+        """
+        try:
+            if len(data) < 8:
+                return None, None
+
+            offset = 0
+
+            # 读取命令长度
+            cmd_len = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+
+            # 验证命令长度合理性
+            if cmd_len <= 0 or cmd_len > 100:
+                return None, None
+
+            if offset + cmd_len > len(data):
+                return None, None
+
+            # 读取命令字符串
+            command = data[offset:offset+cmd_len].decode('utf-8')
+            offset += cmd_len
+
+            if offset + 4 > len(data):
+                return None, None
+
+            # 读取数据长度
+            data_len = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+
+            if data_len < 0 or offset + data_len > len(data):
+                return None, None
+
+            # 读取数据
+            payload = data[offset:offset+data_len]
+
+            logger.info(f"解析 NetworkDataProtocol: command={command}, data_len={data_len}")
+
+            # 根据命令类型处理
+            if command == "OPEN_CAMERA":
+                # 解析 CameraRequest 二进制数据
+                camera_config = PacketParser._parse_camera_request(payload)
+                if camera_config:
+                    return ProtocolConstants.CMD_FUNCTION, {
+                        "functionName": "OpenCamera",
+                        "value": camera_config
+                    }
+
+            elif command == "CLOSE_CAMERA":
+                return ProtocolConstants.CMD_FUNCTION, {
+                    "functionName": "StopReceivePcCamera"
+                }
+
+            return None, None
+
+        except Exception as e:
+            logger.debug(f"NetworkDataProtocol 解析失败: {e}")
+            return None, None
+
+    @staticmethod
+    def _parse_camera_request(data: bytes) -> dict:
+        """
+        解析 CameraRequest 二进制数据
+        参考 Unity CameraRequestSerializer
+
+        格式:
+        [Magic: 0xCA 0xFE][Version: 1byte][width:4][height:4][fps:4][bitrate:4]
+        [enableMvHevc:4][renderMode:4][port:4][camera_len:1][camera][ip_len:1][ip]
+        """
+        try:
+            if len(data) < 10:
+                logger.warning(f"CameraRequest 数据太短: {len(data)} bytes")
+                return None
+
+            offset = 0
+
+            # 检查魔数 0xCA 0xFE
+            if data[0] == 0xCA and data[1] == 0xFE:
+                offset = 2
+                # 读取版本号
+                version = data[offset]
+                offset += 1
+                logger.debug(f"CameraRequest 协议版本: {version}")
+            else:
+                logger.debug("无魔数头，尝试直接解析")
+
+            # 读取整数字段 (小端序)
+            width = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+
+            height = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+
+            fps = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+
+            bitrate = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+
+            enable_hevc = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+
+            render_mode = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+
+            port = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+
+            # 读取 camera 字符串 (1字节长度前缀)
+            camera_len = data[offset]
+            offset += 1
+            camera = data[offset:offset+camera_len].decode('utf-8') if camera_len > 0 else "USB"
+            offset += camera_len
+
+            # 读取 ip 字符串 (1字节长度前缀)
+            ip_len = data[offset]
+            offset += 1
+            ip = data[offset:offset+ip_len].decode('utf-8') if ip_len > 0 else ""
+            offset += ip_len
+
+            logger.info(f"CameraRequest: {width}x{height}@{fps}fps, {bitrate}bps, ip={ip}:{port}, camera={camera}")
+
+            return {
+                "width": width,
+                "height": height,
+                "fps": fps,
+                "bitrate": bitrate,
+                "ip": ip,
+                "port": port,
+                "cameraType": camera
+            }
+
+        except Exception as e:
+            logger.error(f"解析 CameraRequest 失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    @staticmethod
+    def _try_parse_xrobo_protocol(data: bytes) -> tuple:
+        """尝试解析 XRoboToolkit 标准协议格式"""
         # 查找包头
         head_idx = -1
         for i in range(len(data)):
@@ -116,8 +273,7 @@ class PacketParser:
                 break
 
         if head_idx < 0:
-            # 尝试直接解析 JSON (简化模式)
-            return PacketParser._try_parse_json(data)
+            return None, None
 
         try:
             # 解析包头后的命令字节
@@ -131,7 +287,7 @@ class PacketParser:
             data_end = data_start + length
 
             if data_end > len(data):
-                return PacketParser._try_parse_json(data)
+                return None, None
 
             payload = data[data_start:data_end]
 
@@ -144,9 +300,9 @@ class PacketParser:
                 pass
 
         except Exception as e:
-            logger.debug(f"标准包解析失败: {e}")
+            logger.debug(f"XRobo 协议解析失败: {e}")
 
-        return PacketParser._try_parse_json(data)
+        return None, None
 
     @staticmethod
     def _try_parse_json(data: bytes) -> tuple:

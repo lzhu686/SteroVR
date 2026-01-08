@@ -416,21 +416,35 @@ class H264VideoSender:
         }
 
 
-# ============== 简化版: 直接使用 OpenCV VideoWriter + FFmpeg ==============
+# ============== TCP H.264 发送器 (兼容 OrinVideoSender) ==============
 
 class SimpleH264Sender:
     """
-    简化版 H.264 发送器
-    使用 OpenCV + FFmpeg，无需安装 GStreamer
-    适用于快速测试
+    TCP H.264 发送器
+    完全兼容 OrinVideoSender 的协议格式:
+    - 使用 TCP 连接 (不是 UDP)
+    - 帧格式: [length:4 bytes Big-Endian][H.264 NAL data]
+    - 无 RTP 封装
+
+    参考: XRoboToolkit-Orin-Video-Sender/main_zed_asio.cpp
     """
 
     def __init__(self, config: Optional[VideoConfig] = None):
         self.config = config or VideoConfig()
         self.cap: Optional[cv2.VideoCapture] = None
         self.ffmpeg_process: Optional[subprocess.Popen] = None
+        self.tcp_socket: Optional[socket.socket] = None
         self.is_running = False
         self.send_thread: Optional[threading.Thread] = None
+        self.target_ip = ""
+        self.target_port = 0
+
+        # 统计信息
+        self.stats = {
+            'frames_sent': 0,
+            'bytes_sent': 0,
+            'start_time': 0.0
+        }
 
     def initialize(self, device_id: int = 0) -> bool:
         """初始化相机"""
@@ -447,16 +461,48 @@ class SimpleH264Sender:
             logger.error("无法打开相机")
             return False
 
+        # 验证实际参数
+        actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        logger.info(f"相机配置: {actual_w}x{actual_h} @ {actual_fps:.1f}fps")
+
         logger.info("相机初始化成功")
         return True
 
     def start_streaming(self, target_ip: str, target_port: int) -> bool:
-        """开始流式传输 (使用 FFmpeg)"""
+        """
+        开始流式传输 (TCP H.264)
+
+        工作流程:
+        1. 连接到 Unity Client 的 MediaDecoder TCP 服务
+        2. 使用 FFmpeg 编码 H.264
+        3. 读取 FFmpeg 输出的 H.264 NAL 单元
+        4. 封装为 [length:4][data] 格式发送
+        """
         if self.is_running:
+            logger.warning("已经在传输中")
             return False
 
-        # FFmpeg 命令
-        # 注意: XRoboToolkit 的 MediaDecoder 期望的是 RTP H.264 流
+        self.target_ip = target_ip
+        self.target_port = target_port
+
+        # 连接到 Unity Client 的 MediaDecoder
+        logger.info(f"连接到 {target_ip}:{target_port}...")
+        try:
+            self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.tcp_socket.settimeout(10)
+            self.tcp_socket.connect((target_ip, target_port))
+            logger.info(f"TCP 连接成功: {target_ip}:{target_port}")
+        except Exception as e:
+            logger.error(f"TCP 连接失败: {e}")
+            return False
+
+        # FFmpeg 命令 - 输出 H.264 annex-b 格式到 stdout
+        # 关键参数:
+        # - insert-sps-pps: 每个关键帧前插入 SPS/PPS (与 OrinVideoSender 一致)
+        # - annexb: 使用 Annex-B 格式 (startcode: 00 00 00 01)
         ffmpeg_cmd = [
             'ffmpeg',
             '-y',
@@ -471,32 +517,46 @@ class SimpleH264Sender:
             '-tune', 'zerolatency',
             '-b:v', f'{self.config.bitrate // 1000}k',
             '-g', str(self.config.keyframe_interval),
-            '-f', 'rtp',
-            f'rtp://{target_ip}:{target_port}'
+            '-x264-params', f'keyint={self.config.keyframe_interval}:min-keyint={self.config.keyframe_interval}',
+            '-bsf:v', 'h264_mp4toannexb',  # 确保 Annex-B 格式
+            '-f', 'h264',  # 输出原始 H.264 流
+            '-'  # 输出到 stdout
         ]
 
         try:
+            logger.info(f"启动 FFmpeg 编码器...")
             self.ffmpeg_process = subprocess.Popen(
                 ffmpeg_cmd,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL
             )
-
-            self.is_running = True
-            self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
-            self.send_thread.start()
-
-            logger.info(f"开始向 {target_ip}:{target_port} 发送 H.264 流 (FFmpeg)")
-            return True
-
         except Exception as e:
             logger.error(f"启动 FFmpeg 失败: {e}")
+            self.tcp_socket.close()
             return False
 
-    def _send_loop(self):
-        """发送循环"""
+        # 启动发送线程
+        self.is_running = True
+        self.stats['start_time'] = time.time()
+        self.stats['frames_sent'] = 0
+        self.stats['bytes_sent'] = 0
+
+        # 启动采集线程 (写入 FFmpeg stdin)
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.capture_thread.start()
+
+        # 启动发送线程 (从 FFmpeg stdout 读取并发送)
+        self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
+        self.send_thread.start()
+
+        logger.info(f"开始向 {target_ip}:{target_port} 发送 TCP H.264 流")
+        return True
+
+    def _capture_loop(self):
+        """采集循环 - 读取相机帧并写入 FFmpeg"""
         frame_interval = 1.0 / self.config.fps
+        frame_count = 0
 
         while self.is_running and self.cap and self.cap.isOpened():
             loop_start = time.time()
@@ -505,36 +565,150 @@ class SimpleH264Sender:
             if ret and frame is not None:
                 try:
                     self.ffmpeg_process.stdin.write(frame.tobytes())
-                except:
+                    frame_count += 1
+
+                    if frame_count % 60 == 0:
+                        logger.debug(f"已采集 {frame_count} 帧")
+                except Exception as e:
+                    logger.error(f"写入 FFmpeg 失败: {e}")
                     break
 
             elapsed = time.time() - loop_start
             if elapsed < frame_interval:
                 time.sleep(frame_interval - elapsed)
 
+        # 关闭 FFmpeg stdin
+        try:
+            self.ffmpeg_process.stdin.close()
+        except:
+            pass
+
+    def _send_loop(self):
+        """
+        发送循环 - 从 FFmpeg 读取 H.264 并通过 TCP 发送
+
+        帧格式 (与 OrinVideoSender 一致):
+        [length: 4 bytes, Big-Endian][H.264 NAL data]
+        """
+        # 缓冲区用于累积 NAL 单元
+        buffer = b''
+        NAL_STARTCODE = b'\x00\x00\x00\x01'
+        NAL_STARTCODE_3 = b'\x00\x00\x01'
+
+        while self.is_running:
+            try:
+                # 从 FFmpeg stdout 读取数据
+                chunk = self.ffmpeg_process.stdout.read(65536)
+                if not chunk:
+                    if self.ffmpeg_process.poll() is not None:
+                        logger.info("FFmpeg 进程已结束")
+                        break
+                    continue
+
+                buffer += chunk
+
+                # 查找并发送完整的 NAL 单元
+                while True:
+                    # 查找第一个 startcode
+                    start_idx = buffer.find(NAL_STARTCODE)
+                    if start_idx < 0:
+                        start_idx = buffer.find(NAL_STARTCODE_3)
+                        if start_idx < 0:
+                            break
+                        startcode_len = 3
+                    else:
+                        startcode_len = 4
+
+                    # 查找下一个 startcode
+                    next_idx = buffer.find(NAL_STARTCODE, start_idx + startcode_len)
+                    if next_idx < 0:
+                        next_idx = buffer.find(NAL_STARTCODE_3, start_idx + startcode_len)
+                        if next_idx < 0:
+                            break  # 等待更多数据
+
+                    # 提取 NAL 单元 (包含 startcode)
+                    nal_unit = buffer[start_idx:next_idx]
+                    buffer = buffer[next_idx:]
+
+                    # 发送 NAL 单元
+                    self._send_nal_unit(nal_unit)
+
+            except Exception as e:
+                logger.error(f"发送循环错误: {e}")
+                break
+
+    def _send_nal_unit(self, nal_data: bytes):
+        """
+        发送单个 NAL 单元
+        格式: [length: 4 bytes Big-Endian][data]
+        """
+        if not self.tcp_socket or not nal_data:
+            return
+
+        try:
+            # 构建帧包 (OrinVideoSender 格式)
+            size = len(nal_data)
+            packet = struct.pack('>I', size) + nal_data  # Big-Endian length
+
+            self.tcp_socket.sendall(packet)
+
+            self.stats['frames_sent'] += 1
+            self.stats['bytes_sent'] += len(packet)
+
+            if self.stats['frames_sent'] % 100 == 0:
+                elapsed = time.time() - self.stats['start_time']
+                fps = self.stats['frames_sent'] / elapsed if elapsed > 0 else 0
+                mbps = (self.stats['bytes_sent'] * 8) / (elapsed * 1000000) if elapsed > 0 else 0
+                logger.info(f"已发送 {self.stats['frames_sent']} 个 NAL, {mbps:.1f} Mbps, {fps:.1f} NAL/s")
+
+        except Exception as e:
+            logger.error(f"发送 NAL 失败: {e}")
+            self.is_running = False
+
     def stop_streaming(self):
         """停止传输"""
+        logger.info("正在停止视频流...")
         self.is_running = False
+
+        if hasattr(self, 'capture_thread') and self.capture_thread:
+            self.capture_thread.join(timeout=2)
 
         if self.send_thread:
             self.send_thread.join(timeout=2)
 
         if self.ffmpeg_process:
-            self.ffmpeg_process.stdin.close()
+            try:
+                self.ffmpeg_process.stdin.close()
+            except:
+                pass
             self.ffmpeg_process.terminate()
+            try:
+                self.ffmpeg_process.wait(timeout=2)
+            except:
+                self.ffmpeg_process.kill()
+
+        if self.tcp_socket:
+            try:
+                self.tcp_socket.close()
+            except:
+                pass
 
         if self.cap:
             self.cap.release()
 
-        logger.info("视频流已停止")
+        # 打印统计
+        elapsed = time.time() - self.stats['start_time'] if self.stats['start_time'] > 0 else 0
+        logger.info(f"视频流已停止. 统计: {self.stats['frames_sent']} NAL, "
+                   f"{self.stats['bytes_sent'] / 1024 / 1024:.1f} MB, {elapsed:.1f}s")
 
 
 # ============== 测试代码 ==============
 
 def test_simple_sender():
-    """测试简化版发送器"""
+    """测试 TCP H.264 发送器"""
     print("=" * 60)
-    print("H.264 视频发送器测试")
+    print("TCP H.264 视频发送器测试")
+    print("兼容 OrinVideoSender / XRoboToolkit-Unity-Client")
     print("=" * 60)
 
     config = VideoConfig(width=2560, height=720, fps=60, bitrate=8000000)
@@ -544,11 +718,17 @@ def test_simple_sender():
         print("相机初始化失败")
         return
 
-    target_ip = input("请输入目标 IP (PICO 头显 IP): ").strip() or "192.168.1.100"
+    print("\n请在 PICO 头显上:")
+    print("1. 启动 Unity Client")
+    print("2. 选择 USB_STEREO 相机")
+    print("3. 点击 Listen 按钮")
+    print("4. 记录显示的 IP 和端口\n")
+
+    target_ip = input("请输入 PICO 头显 IP: ").strip() or "192.168.1.100"
     target_port = int(input("请输入目标端口 (默认 12345): ").strip() or "12345")
 
     if sender.start_streaming(target_ip, target_port):
-        print(f"\n正在向 {target_ip}:{target_port} 发送视频流...")
+        print(f"\n正在向 {target_ip}:{target_port} 发送 TCP H.264 视频流...")
         print("按 Ctrl+C 停止\n")
 
         try:
