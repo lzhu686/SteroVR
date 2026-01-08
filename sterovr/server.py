@@ -88,15 +88,13 @@ def get_ssl_context():
     """获取SSL上下文，使用项目根目录的证书"""
     # 查找证书文件
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(os.path.dirname(script_dir))  # 向上两级到项目根目录
+    project_root = os.path.dirname(script_dir)  # 向上一级到项目根目录
 
     cert_locations = [
         # 优先使用项目根目录的证书
-        (os.path.join(project_root, "webxr_cert.pem"), os.path.join(project_root, "webxr_key.pem")),
+        (os.path.join(project_root, "server.crt"), os.path.join(project_root, "server.key")),
         # 当前目录
         (os.path.join(script_dir, "server.crt"), os.path.join(script_dir, "server.key")),
-        # 标准位置
-        ("server.crt", "server.key"),
     ]
 
     for cert_file, key_file in cert_locations:
@@ -106,8 +104,8 @@ def get_ssl_context():
             ssl_context.load_cert_chain(cert_file, key_file)
             return ssl_context
 
-    logger.warning("⚠️ 未找到SSL证书，将尝试自动生成...")
-    return generate_self_signed_cert(script_dir)
+    logger.warning("未找到SSL证书，将尝试自动生成...")
+    return generate_self_signed_cert(project_root)
 
 
 def generate_self_signed_cert(output_dir):

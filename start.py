@@ -25,8 +25,9 @@ import subprocess
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
-# 添加当前目录到路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 项目根目录
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT_DIR)
 
 HTTPS_PORT = 8445
 WSS_PORT = 8765
@@ -66,13 +67,13 @@ def setup_adb_reverse():
 
 def start_https_server():
     """启动 HTTPS 文件服务器"""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    web_dir = os.path.join(script_dir, "web")
-    cert_file = os.path.join(script_dir, "server.crt")
-    key_file = os.path.join(script_dir, "server.key")
+    web_dir = os.path.join(ROOT_DIR, "web")
+    cert_file = os.path.join(ROOT_DIR, "server.crt")
+    key_file = os.path.join(ROOT_DIR, "server.key")
 
+    # 生成证书
     if not os.path.exists(cert_file) or not os.path.exists(key_file):
-        print("🔐 正在生成SSL证书...")
+        print("正在生成SSL证书...")
         subprocess.run([
             'openssl', 'req', '-x509', '-newkey', 'rsa:2048',
             '-keyout', key_file, '-out', cert_file,
@@ -80,11 +81,15 @@ def start_https_server():
             '-subj', '/CN=localhost'
         ], capture_output=True)
 
-    os.chdir(web_dir)
+    # 自定义 Handler，指定 web 目录为根目录（无需 chdir）
+    Handler = lambda *args, **kwargs: SimpleHTTPRequestHandler(
+        *args, directory=web_dir, **kwargs
+    )
+
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_context.load_cert_chain(cert_file, key_file)
 
-    server = HTTPServer(('0.0.0.0', HTTPS_PORT), SimpleHTTPRequestHandler)
+    server = HTTPServer(('0.0.0.0', HTTPS_PORT), Handler)
     server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
     server.serve_forever()
 
