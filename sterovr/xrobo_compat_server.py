@@ -470,6 +470,10 @@ class XRoboCompatServer:
                     self._process_command(json_data, client)
 
             except socket.timeout:
+                # 超时时检查视频流是否还在运行
+                if self.video_sender and self.video_sender.is_running:
+                    # 视频流正在运行，继续等待
+                    continue
                 # 发送心跳
                 try:
                     heartbeat = PacketParser.build_response(
@@ -482,10 +486,17 @@ class XRoboCompatServer:
 
             except Exception as e:
                 logger.error(f"处理客户端数据错误: {e}")
+                # 如果视频流正在运行，不要因为控制连接断开而停止
+                if self.video_sender and self.video_sender.is_running:
+                    logger.info("控制连接已断开，但视频流继续运行...")
+                    # 保持服务器运行，等待下一个连接
+                    break
                 break
 
-        # 清理
-        self._stop_video_stream()
+        # 只有当视频流没有在运行时才关闭
+        # 如果视频流正在运行，让它继续
+        if not (self.video_sender and self.video_sender.is_running):
+            self._stop_video_stream()
         client.close()
 
     def _process_command(self, json_data: dict, client: socket.socket):
