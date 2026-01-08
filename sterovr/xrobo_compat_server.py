@@ -127,7 +127,12 @@ class PacketParser:
         格式: [cmd_len:4bytes][command:string][data_len:4bytes][data:bytes]
         """
         try:
+            # 打印收到的原始数据前64字节（用于调试）
+            hex_preview = data[:min(64, len(data))].hex()
+            logger.info(f"[DEBUG] 收到数据 ({len(data)} bytes): {hex_preview}...")
+
             if len(data) < 8:
+                logger.debug(f"[DEBUG] 数据太短: {len(data)} < 8")
                 return None, None
 
             offset = 0
@@ -135,9 +140,11 @@ class PacketParser:
             # 读取命令长度
             cmd_len = struct.unpack('<I', data[offset:offset+4])[0]
             offset += 4
+            logger.info(f"[DEBUG] cmd_len = {cmd_len}")
 
             # 验证命令长度合理性
             if cmd_len <= 0 or cmd_len > 100:
+                logger.info(f"[DEBUG] cmd_len 不合理: {cmd_len}")
                 return None, None
 
             if offset + cmd_len > len(data):
