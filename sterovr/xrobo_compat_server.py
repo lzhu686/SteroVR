@@ -384,15 +384,78 @@ class XRoboCompatServer:
         self.video_sender: Optional[SimpleH264Sender] = None
         self.is_running = False
         self.client_thread: Optional[threading.Thread] = None
+        self.adb_connected = False  # ADB 连接状态
 
         # 回调
         self.on_client_connected: Optional[Callable[[str], None]] = None
         self.on_streaming_started: Optional[Callable[[str, int], None]] = None
         self.on_streaming_stopped: Optional[Callable[[], None]] = None
 
+    def _check_adb_connection(self) -> bool:
+        """检测是否有 ADB 设备连接"""
+        try:
+            import subprocess
+            result = subprocess.run(['adb', 'devices'], capture_output=True, text=True, timeout=5)
+            lines = result.stdout.strip().split('\n')[1:]  # 跳过标题行
+            devices = [l.split('\t')[0] for l in lines if '\tdevice' in l]
+            return len(devices) > 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    def _setup_adb_forward(self, port: int) -> bool:
+        """
+        设置 ADB forward (PC -> PICO)
+        用于视频端口: PC 连接 127.0.0.1:port -> PICO 的 127.0.0.1:port
+        """
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['adb', 'forward', f'tcp:{port}', f'tcp:{port}'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                logger.info(f"✅ ADB forward 已设置: PC:127.0.0.1:{port} -> PICO:127.0.0.1:{port}")
+                return True
+            else:
+                logger.warning(f"ADB forward 失败: {result.stderr}")
+                return False
+        except Exception as e:
+            logger.warning(f"ADB forward 异常: {e}")
+            return False
+
+    def _setup_adb_reverse(self, port: int) -> bool:
+        """
+        设置 ADB reverse (PICO -> PC)
+        用于控制端口: PICO 连接 127.0.0.1:port -> PC 的 127.0.0.1:port
+        """
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['adb', 'reverse', f'tcp:{port}', f'tcp:{port}'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                logger.info(f"✅ ADB reverse 已设置: PICO:127.0.0.1:{port} -> PC:127.0.0.1:{port}")
+                return True
+            else:
+                logger.warning(f"ADB reverse 失败: {result.stderr}")
+                return False
+        except Exception as e:
+            logger.warning(f"ADB reverse 异常: {e}")
+            return False
+
     def start(self) -> bool:
         """启动服务器"""
         try:
+            # 检测 ADB 连接
+            self.adb_connected = self._check_adb_connection()
+            if self.adb_connected:
+                logger.info("✅ 检测到 ADB USB 连接，将使用 127.0.0.1 进行视频传输")
+                # 设置控制端口的 reverse (PICO 连接 127.0.0.1:13579 -> PC 的服务器)
+                self._setup_adb_reverse(ProtocolConstants.TCP_PORT)
+            else:
+                logger.info("ℹ️  未检测到 ADB 连接，将使用 WiFi IP 进行视频传输")
+
             # 创建 TCP 服务器
             self.tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -530,6 +593,18 @@ class XRoboCompatServer:
         """处理 StartReceivePcCamera 命令"""
         request = CameraRequest.from_json(params)
 
+        # 如果检测到 ADB 连接，使用 127.0.0.1 替代客户端报告的 IP
+        original_ip = request.ip
+        if self.adb_connected:
+            request.ip = "127.0.0.1"
+            logger.info(f"🔌 ADB 模式: 将目标 IP 从 {original_ip} 改为 127.0.0.1")
+            # 等待 MediaDecoder 启动监听
+            logger.info("⏳ 等待 PICO MediaDecoder 启动监听 (2秒)...")
+            import time
+            time.sleep(2.0)
+            # 设置端口转发 (视频端口: PC连接PICO，用forward)
+            self._setup_adb_forward(request.port)
+
         logger.info(f"开始视频流: {request.ip}:{request.port}")
         logger.info(f"参数: {request.width}x{request.height} @ {request.fps}fps, {request.bitrate//1000000}Mbps")
 
@@ -576,16 +651,50 @@ class XRoboCompatServer:
     def _handle_open_camera(self, params: dict, client: socket.socket):
         """处理 OpenCamera 命令 (来自新版协议)"""
         # 新版协议的参数格式可能不同，需要适配
-        request = CameraRequest(
-            ip=params.get('clientIp', params.get('ip', '')),
-            port=params.get('clientPort', params.get('port', 12345)),
+        target_ip = params.get('clientIp', params.get('ip', ''))
+        target_port = params.get('clientPort', params.get('port', 12345))
+
+        # 如果检测到 ADB 连接，使用 127.0.0.1 替代客户端报告的 IP
+        if self.adb_connected:
+            logger.info(f"🔌 ADB 模式: 将目标 IP 从 {target_ip} 改为 127.0.0.1")
+            target_ip = "127.0.0.1"
+            # 等待 MediaDecoder 启动监听
+            logger.info("⏳ 等待 PICO MediaDecoder 启动监听 (2秒)...")
+            import time
+            time.sleep(2.0)
+            # 设置端口转发 (视频端口: PC连接PICO，用forward)
+            self._setup_adb_forward(target_port)
+
+        # 直接启动视频流，不再调用 _handle_start_camera 避免重复检测
+        logger.info(f"开始视频流: {target_ip}:{target_port}")
+        logger.info(f"参数: {params.get('width', 2560)}x{params.get('height', 720)} @ {params.get('fps', 60)}fps, {params.get('bitrate', 8000000)//1000000}Mbps")
+
+        # 停止现有流
+        self._stop_video_stream()
+
+        # 创建视频发送器
+        config = VideoConfig(
             width=params.get('width', 2560),
             height=params.get('height', 720),
             fps=params.get('fps', 60),
             bitrate=params.get('bitrate', 8000000)
         )
 
-        self._handle_start_camera(request.__dict__, client)
+        self.video_sender = SimpleH264Sender(config)
+
+        if not self.video_sender.initialize(self.device_id):
+            logger.error("相机初始化失败")
+            self._send_error(client, "Camera initialization failed")
+            return
+
+        if self.video_sender.start_streaming(target_ip, target_port):
+            logger.info("视频流已启动")
+
+            if self.on_streaming_started:
+                self.on_streaming_started(target_ip, target_port)
+        else:
+            logger.error("启动视频流失败")
+            self._send_error(client, "Failed to start video stream")
 
     def _handle_stop_camera(self):
         """处理 StopReceivePcCamera 命令"""

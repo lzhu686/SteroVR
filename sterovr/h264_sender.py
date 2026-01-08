@@ -487,23 +487,34 @@ class SimpleH264Sender:
         self.target_ip = target_ip
         self.target_port = target_port
 
-        # 连接到 Unity Client 的 MediaDecoder
+        # 连接到 Unity Client 的 MediaDecoder (带重试)
         logger.info(f"连接到 {target_ip}:{target_port}...")
-        try:
-            self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.tcp_socket.settimeout(10)
-            self.tcp_socket.connect((target_ip, target_port))
-            logger.info(f"TCP 连接成功: {target_ip}:{target_port}")
-        except Exception as e:
-            logger.error(f"TCP 连接失败: {e}")
+        max_retries = 5
+        retry_delay = 0.5
+        connected = False
+
+        for attempt in range(max_retries):
+            try:
+                self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.tcp_socket.settimeout(10)
+                self.tcp_socket.connect((target_ip, target_port))
+                logger.info(f"TCP 连接成功: {target_ip}:{target_port}")
+                connected = True
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"TCP 连接失败 (尝试 {attempt+1}/{max_retries}): {e}, {retry_delay}秒后重试...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 1.5  # 指数退避
+                else:
+                    logger.error(f"TCP 连接失败，已达最大重试次数: {e}")
+
+        if not connected:
             return False
 
         # FFmpeg 命令 - 输出 H.264 annex-b 格式到 stdout
-        # 关键参数:
-        # - pix_fmt yuv420p: 转换为 YUV 4:2:0 (baseline profile 需要)
-        # - repeat-headers: 每帧都包含 SPS/PPS (关键!)
-        # - keyint=1: 每帧都是关键帧，确保 MediaDecoder 能正确解码
+        # 使用GOP=1确保每帧都是关键帧，方便分割和解码
         ffmpeg_cmd = [
             'ffmpeg',
             '-y',
@@ -517,13 +528,13 @@ class SimpleH264Sender:
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
             '-tune', 'zerolatency',
-            '-profile:v', 'baseline',  # 使用 baseline profile 增加兼容性
+            '-profile:v', 'baseline',  # 使用 baseline profile
             '-level', '4.0',
-            '-b:v', f'{self.config.bitrate // 1000}k',
-            '-g', '1',  # 每帧都是关键帧 (GOP=1)
+            '-b:v', '4000k',  # 4Mbps (与官方一致)
+            '-g', '1',  # 每帧都是关键帧
             '-keyint_min', '1',
-            '-x264-params', 'repeat-headers=1:sliced-threads=0',  # 每帧带 SPS/PPS
-            '-f', 'h264',  # 输出原始 H.264 流
+            '-x264-params', 'repeat-headers=1',  # 每帧带 SPS/PPS
+            '-f', 'h264',  # 输出原始 H.264 Annexb 流
             '-'  # 输出到 stdout
         ]
 
@@ -714,13 +725,18 @@ class SimpleH264Sender:
     def _send_frame(self, frame_data: bytes):
         """
         发送一个完整的 H.264 帧
-        格式: [length: 4 bytes Big-Endian][frame data]
+
+        格式与 XRoboToolkit-Orin-Video-Sender 一致:
+        [4字节Big-Endian长度][完整H.264 Annexb数据(含startcode)]
+
+        参考: https://github.com/XR-Robotics/XRoboToolkit-Orin-Video-Sender
         """
         if not self.tcp_socket or not frame_data:
             return
 
         try:
             size = len(frame_data)
+            # 官方格式: 4字节Big-Endian长度 + 完整Annexb数据(含00 00 00 01)
             packet = struct.pack('>I', size) + frame_data
 
             self.tcp_socket.sendall(packet)
@@ -730,13 +746,47 @@ class SimpleH264Sender:
 
             # 前几帧输出详细调试信息
             if self.stats['frames_sent'] <= 3:
-                # 显示帧的前 20 字节
                 hex_preview = frame_data[:min(20, len(frame_data))].hex()
                 logger.info(f"[Frame {self.stats['frames_sent']}] 大小: {size} bytes, 数据头: {hex_preview}...")
 
         except Exception as e:
             logger.error(f"发送帧失败: {e}")
             self.is_running = False
+
+    def _split_nal_units(self, data: bytes) -> list:
+        """
+        将H.264 Annexb流分割成独立的NAL单元（不含startcode）
+        """
+        nal_units = []
+        NAL_START_4 = b'\x00\x00\x00\x01'
+        NAL_START_3 = b'\x00\x00\x01'
+
+        # 找到所有NAL起始位置
+        positions = []
+        pos = 0
+        while pos < len(data) - 3:
+            if data[pos:pos+4] == NAL_START_4:
+                positions.append((pos, 4))
+                pos += 4
+            elif data[pos:pos+3] == NAL_START_3:
+                positions.append((pos, 3))
+                pos += 3
+            else:
+                pos += 1
+
+        # 提取每个NAL单元的数据（不含startcode）
+        for i, (start_pos, startcode_len) in enumerate(positions):
+            nal_start = start_pos + startcode_len
+            if i + 1 < len(positions):
+                nal_end = positions[i + 1][0]
+            else:
+                nal_end = len(data)
+
+            nal_data = data[nal_start:nal_end]
+            if nal_data:
+                nal_units.append(nal_data)
+
+        return nal_units
 
     def _send_nal_unit(self, nal_data: bytes):
         """
