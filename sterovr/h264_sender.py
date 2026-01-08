@@ -501,7 +501,7 @@ class SimpleH264Sender:
 
         # FFmpeg 命令 - 输出 H.264 annex-b 格式到 stdout
         # 关键参数:
-        # - intra-refresh: 使用滚动刷新而非 IDR，减少突发码率
+        # - pix_fmt yuv420p: 转换为 YUV 4:2:0 (baseline profile 需要)
         # - repeat-headers: 每帧都包含 SPS/PPS (关键!)
         # - keyint=1: 每帧都是关键帧，确保 MediaDecoder 能正确解码
         ffmpeg_cmd = [
@@ -513,6 +513,7 @@ class SimpleH264Sender:
             '-s', f'{self.config.width}x{self.config.height}',
             '-r', str(self.config.fps),
             '-i', '-',  # 从 stdin 读取
+            '-vf', 'format=yuv420p',  # 转换为 YUV 4:2:0
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
             '-tune', 'zerolatency',
