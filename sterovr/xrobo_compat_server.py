@@ -5,7 +5,7 @@ XRoboToolkit 协议兼容服务器
 模拟 XRoboToolkit PC-Service 的行为，让 PICO 头显可以直接连接并接收视频流
 
 协议说明:
-1. TCP 端口 63901: 接收来自 Unity Client 的控制命令
+1. TCP 端口 13579: 接收来自 Unity Client 的控制命令
 2. UDP 端口 (动态): 向 Unity Client 发送 H.264 视频流
 
 命令格式:
@@ -48,10 +48,10 @@ logger = logging.getLogger('XRoboCompat')
 # ============== XRoboToolkit 协议常量 ==============
 
 class ProtocolConstants:
-    """协议常量 (参考 XRoboToolkit-Unity-Client 的 PackageHandle.cs)"""
+    """协议常量 (参考 XRoboToolkit-Unity-Client 的 TcpManager.cs)"""
 
-    # 端口
-    TCP_PORT = 63901
+    # 端口 (Unity Client 使用 13579)
+    TCP_PORT = 13579
 
     # 包头包尾
     PACKET_HEAD_SEND = 0x3F      # 发送包头

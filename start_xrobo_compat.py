@@ -183,29 +183,29 @@ def main():
     # 获取网络信息
     local_ip = get_local_ip()
 
-    print("═" * 60)
-    print("📡 网络信息")
-    print("═" * 60)
-    print(f"   本机 IP: {local_ip}")
-    print(f"   TCP 端口: 63901 (控制)")
-    print(f"   相机设备: {args.device}")
-    print(f"   分辨率: {args.width}x{args.height}")
-    print(f"   帧率: {args.fps} FPS")
-    print(f"   码率: {args.bitrate // 1000000} Mbps")
-    print("═" * 60)
+    print("=" * 60)
+    print("Network Info")
+    print("=" * 60)
+    print(f"   Local IP: {local_ip}")
+    print(f"   TCP Port: 13579 (control)")
+    print(f"   Camera Device: {args.device}")
+    print(f"   Resolution: {args.width}x{args.height}")
+    print(f"   FPS: {args.fps}")
+    print(f"   Bitrate: {args.bitrate // 1000000} Mbps")
+    print("=" * 60)
     print()
 
-    print("📱 PICO 头显操作步骤:")
-    print("─" * 40)
-    print("   1. 打开 XRoboToolkit Unity Client")
-    print("   2. 在视频源下拉框选择: USB_STEREO")
-    print(f"   3. 输入 PC IP 地址: {local_ip}")
-    print("   4. 点击 Listen 按钮")
-    print("─" * 40)
+    print("PICO Headset Steps:")
+    print("-" * 40)
+    print("   1. Open XRoboToolkit Unity Client")
+    print("   2. Select video source: USB_STEREO")
+    print(f"   3. Enter PC IP: {local_ip}")
+    print("   4. Click Listen button")
+    print("-" * 40)
     print()
 
-    # 启动服务器
-    print("🚀 启动服务器...")
+    # Start server
+    print("Starting server...")
     print()
 
     try:
