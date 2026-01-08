@@ -587,18 +587,25 @@ class SimpleH264Sender:
         """
         发送循环 - 从 FFmpeg 读取 H.264 并通过 TCP 发送
 
+        关键：按"帧"发送，而不是按单个 NAL 单元发送。
+        一帧可能包含多个 NAL 单元 (SPS, PPS, IDR/P-slice)。
+
+        OrinVideoSender 使用 GStreamer appsink，每次回调获取完整帧。
+        我们需要模拟这个行为：收集属于同一帧的所有 NAL，然后一起发送。
+
         帧格式 (与 OrinVideoSender 一致):
-        [length: 4 bytes, Big-Endian][H.264 NAL data]
+        [length: 4 bytes, Big-Endian][H.264 frame data (可能包含多个 NAL)]
         """
-        # 缓冲区用于累积 NAL 单元
         buffer = b''
         NAL_STARTCODE = b'\x00\x00\x00\x01'
-        NAL_STARTCODE_3 = b'\x00\x00\x01'
+
+        # 帧累积器
+        frame_buffer = b''
 
         while self.is_running:
             try:
                 # 从 FFmpeg stdout 读取数据
-                chunk = self.ffmpeg_process.stdout.read(65536)
+                chunk = self.ffmpeg_process.stdout.read(32768)
                 if not chunk:
                     if self.ffmpeg_process.poll() is not None:
                         logger.info("FFmpeg 进程已结束")
@@ -607,63 +614,88 @@ class SimpleH264Sender:
 
                 buffer += chunk
 
-                # 查找并发送完整的 NAL 单元
-                while True:
-                    # 查找第一个 startcode
-                    start_idx = buffer.find(NAL_STARTCODE)
-                    if start_idx < 0:
-                        start_idx = buffer.find(NAL_STARTCODE_3)
-                        if start_idx < 0:
-                            break
-                        startcode_len = 3
-                    else:
-                        startcode_len = 4
+                # 处理缓冲区中的数据
+                while len(buffer) >= 5:  # 至少需要 startcode + 1 byte
+                    # 查找 startcode
+                    idx = buffer.find(NAL_STARTCODE)
+                    if idx < 0:
+                        # 保留最后 3 字节（可能是不完整的 startcode）
+                        if len(buffer) > 3:
+                            frame_buffer += buffer[:-3]
+                            buffer = buffer[-3:]
+                        break
+
+                    if idx > 0:
+                        # startcode 之前的数据属于当前帧
+                        frame_buffer += buffer[:idx]
+                        buffer = buffer[idx:]
+                        continue
+
+                    # 找到 startcode，检查 NAL 类型
+                    if len(buffer) < 5:
+                        break
+
+                    nal_type = buffer[4] & 0x1F
+
+                    # 如果是新的 Access Unit (SPS/PPS/IDR/AUD)，发送之前累积的帧
+                    # NAL types: 7=SPS, 8=PPS, 5=IDR, 9=AUD, 1=non-IDR
+                    is_new_frame = nal_type in (7, 9)  # SPS 或 AUD 开始新帧
+
+                    if is_new_frame and len(frame_buffer) > 0:
+                        # 发送之前累积的帧
+                        self._send_frame(frame_buffer)
+                        frame_buffer = b''
 
                     # 查找下一个 startcode
-                    next_idx = buffer.find(NAL_STARTCODE, start_idx + startcode_len)
+                    next_idx = buffer.find(NAL_STARTCODE, 4)
                     if next_idx < 0:
-                        next_idx = buffer.find(NAL_STARTCODE_3, start_idx + startcode_len)
-                        if next_idx < 0:
-                            break  # 等待更多数据
+                        # 没有找到下一个 startcode，需要更多数据
+                        break
 
-                    # 提取 NAL 单元 (包含 startcode)
-                    nal_unit = buffer[start_idx:next_idx]
+                    # 提取当前 NAL 并添加到帧缓冲区
+                    frame_buffer += buffer[:next_idx]
                     buffer = buffer[next_idx:]
-
-                    # 发送 NAL 单元
-                    self._send_nal_unit(nal_unit)
 
             except Exception as e:
                 logger.error(f"发送循环错误: {e}")
                 break
 
-    def _send_nal_unit(self, nal_data: bytes):
+        # 发送剩余数据
+        if frame_buffer:
+            self._send_frame(frame_buffer)
+
+    def _send_frame(self, frame_data: bytes):
         """
-        发送单个 NAL 单元
-        格式: [length: 4 bytes Big-Endian][data]
+        发送一个完整的 H.264 帧
+        格式: [length: 4 bytes Big-Endian][frame data]
         """
-        if not self.tcp_socket or not nal_data:
+        if not self.tcp_socket or not frame_data:
             return
 
         try:
-            # 构建帧包 (OrinVideoSender 格式)
-            size = len(nal_data)
-            packet = struct.pack('>I', size) + nal_data  # Big-Endian length
+            size = len(frame_data)
+            packet = struct.pack('>I', size) + frame_data
 
             self.tcp_socket.sendall(packet)
 
             self.stats['frames_sent'] += 1
             self.stats['bytes_sent'] += len(packet)
 
-            if self.stats['frames_sent'] % 100 == 0:
+            if self.stats['frames_sent'] % 30 == 0:  # 每 30 帧打印一次
                 elapsed = time.time() - self.stats['start_time']
                 fps = self.stats['frames_sent'] / elapsed if elapsed > 0 else 0
                 mbps = (self.stats['bytes_sent'] * 8) / (elapsed * 1000000) if elapsed > 0 else 0
-                logger.info(f"已发送 {self.stats['frames_sent']} 个 NAL, {mbps:.1f} Mbps, {fps:.1f} NAL/s")
+                logger.info(f"已发送 {self.stats['frames_sent']} 帧, {mbps:.1f} Mbps, {fps:.1f} fps")
 
         except Exception as e:
-            logger.error(f"发送 NAL 失败: {e}")
+            logger.error(f"发送帧失败: {e}")
             self.is_running = False
+
+    def _send_nal_unit(self, nal_data: bytes):
+        """
+        发送单个 NAL 单元 (已废弃，保留兼容)
+        """
+        self._send_frame(nal_data)
 
     def stop_streaming(self):
         """停止传输"""

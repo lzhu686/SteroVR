@@ -446,58 +446,54 @@ class XRoboCompatServer:
             return False
 
     def _handle_client(self, client: socket.socket, addr: tuple):
-        """处理客户端连接"""
-        client_ip = addr[0]
+        """
+        处理客户端连接
+
+        Unity Client 使用"一次性命令"模式:
+        1. 连接 → 2. 发送命令 → 3. 立即断开
+        这是正常行为，不是错误。
+        """
         buffer = b''
 
-        while self.is_running:
-            try:
-                client.settimeout(30.0)
-                data = client.recv(4096)
+        try:
+            # 设置较短的超时，因为 Unity Client 发送命令后会立即断开
+            client.settimeout(5.0)
 
-                if not data:
-                    logger.info(f"客户端断开连接: {addr}")
-                    break
-
-                buffer += data
-                logger.debug(f"收到数据 ({len(data)} bytes)")
-
-                # 解析命令
-                cmd, json_data = PacketParser.parse(buffer)
-
-                if json_data:
-                    buffer = b''  # 清空缓冲区
-                    self._process_command(json_data, client)
-
-            except socket.timeout:
-                # 超时时检查视频流是否还在运行
-                if self.video_sender and self.video_sender.is_running:
-                    # 视频流正在运行，继续等待
-                    continue
-                # 发送心跳
+            while self.is_running:
                 try:
-                    heartbeat = PacketParser.build_response(
-                        ProtocolConstants.CMD_HEARTBEAT,
-                        {"status": "alive"}
-                    )
-                    client.send(heartbeat)
-                except:
+                    data = client.recv(4096)
+
+                    if not data:
+                        # 客户端正常关闭连接
+                        logger.info(f"客户端完成命令发送: {addr}")
+                        break
+
+                    buffer += data
+
+                    # 解析命令
+                    _, json_data = PacketParser.parse(buffer)
+
+                    if json_data:
+                        buffer = b''
+                        self._process_command(json_data, client)
+                        # 命令处理完成后，Unity Client 会断开
+                        # 不需要继续等待更多数据
+
+                except socket.timeout:
+                    # 超时 = 没有更多数据，正常退出
                     break
 
-            except Exception as e:
-                logger.error(f"处理客户端数据错误: {e}")
-                # 如果视频流正在运行，不要因为控制连接断开而停止
-                if self.video_sender and self.video_sender.is_running:
-                    logger.info("控制连接已断开，但视频流继续运行...")
-                    # 保持服务器运行，等待下一个连接
+                except ConnectionResetError:
+                    # Unity Client 发送命令后立即关闭连接，这是正常的
+                    logger.info(f"客户端命令发送完成 (连接已关闭): {addr}")
                     break
-                break
 
-        # 只有当视频流没有在运行时才关闭
-        # 如果视频流正在运行，让它继续
-        if not (self.video_sender and self.video_sender.is_running):
-            self._stop_video_stream()
-        client.close()
+        except Exception as e:
+            logger.warning(f"客户端处理异常: {e}")
+
+        finally:
+            client.close()
+            # 注意：不要在这里停止视频流，让它继续运行
 
     def _process_command(self, json_data: dict, client: socket.socket):
         """处理命令"""
