@@ -501,8 +501,9 @@ class SimpleH264Sender:
 
         # FFmpeg 命令 - 输出 H.264 annex-b 格式到 stdout
         # 关键参数:
-        # - insert-sps-pps: 每个关键帧前插入 SPS/PPS (与 OrinVideoSender 一致)
-        # - annexb: 使用 Annex-B 格式 (startcode: 00 00 00 01)
+        # - intra-refresh: 使用滚动刷新而非 IDR，减少突发码率
+        # - repeat-headers: 每帧都包含 SPS/PPS (关键!)
+        # - keyint=1: 每帧都是关键帧，确保 MediaDecoder 能正确解码
         ffmpeg_cmd = [
             'ffmpeg',
             '-y',
@@ -515,10 +516,12 @@ class SimpleH264Sender:
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
             '-tune', 'zerolatency',
+            '-profile:v', 'baseline',  # 使用 baseline profile 增加兼容性
+            '-level', '4.0',
             '-b:v', f'{self.config.bitrate // 1000}k',
-            '-g', str(self.config.keyframe_interval),
-            '-x264-params', f'keyint={self.config.keyframe_interval}:min-keyint={self.config.keyframe_interval}',
-            '-bsf:v', 'h264_mp4toannexb',  # 确保 Annex-B 格式
+            '-g', '1',  # 每帧都是关键帧 (GOP=1)
+            '-keyint_min', '1',
+            '-x264-params', 'repeat-headers=1:sliced-threads=0',  # 每帧带 SPS/PPS
             '-f', 'h264',  # 输出原始 H.264 流
             '-'  # 输出到 stdout
         ]
@@ -587,20 +590,20 @@ class SimpleH264Sender:
         """
         发送循环 - 从 FFmpeg 读取 H.264 并通过 TCP 发送
 
-        关键：按"帧"发送，而不是按单个 NAL 单元发送。
-        一帧可能包含多个 NAL 单元 (SPS, PPS, IDR/P-slice)。
+        由于设置了 GOP=1 和 repeat-headers=1，每帧都以 SPS NAL 开头。
+        我们按 SPS 分割数据流，每个 SPS 到下一个 SPS 之间的数据就是一帧。
 
-        OrinVideoSender 使用 GStreamer appsink，每次回调获取完整帧。
-        我们需要模拟这个行为：收集属于同一帧的所有 NAL，然后一起发送。
-
-        帧格式 (与 OrinVideoSender 一致):
-        [length: 4 bytes, Big-Endian][H.264 frame data (可能包含多个 NAL)]
+        与 OrinVideoSender 一致的格式:
+        [length: 4 bytes, Big-Endian][H.264 frame data]
         """
         buffer = b''
-        NAL_STARTCODE = b'\x00\x00\x00\x01'
+        NAL_STARTCODE_4 = b'\x00\x00\x00\x01'
 
-        # 帧累积器
-        frame_buffer = b''
+        frame_count = 0
+        last_log_time = time.time()
+        first_sps_found = False
+
+        logger.info("开始发送 H.264 数据流 (按帧发送, GOP=1)...")
 
         while self.is_running:
             try:
@@ -610,59 +613,92 @@ class SimpleH264Sender:
                     if self.ffmpeg_process.poll() is not None:
                         logger.info("FFmpeg 进程已结束")
                         break
+                    time.sleep(0.001)
                     continue
 
                 buffer += chunk
 
-                # 处理缓冲区中的数据
-                while len(buffer) >= 5:  # 至少需要 startcode + 1 byte
-                    # 查找 startcode
-                    idx = buffer.find(NAL_STARTCODE)
-                    if idx < 0:
-                        # 保留最后 3 字节（可能是不完整的 startcode）
-                        if len(buffer) > 3:
-                            frame_buffer += buffer[:-3]
-                            buffer = buffer[-3:]
-                        break
-
-                    if idx > 0:
-                        # startcode 之前的数据属于当前帧
-                        frame_buffer += buffer[:idx]
-                        buffer = buffer[idx:]
+                # 按 SPS NAL (type 7) 分割帧
+                while len(buffer) > 5:
+                    # 首先确保我们从 SPS 开始（对于第一帧）
+                    if not first_sps_found:
+                        # 找到第一个 SPS
+                        sps_idx = self._find_nal_type(buffer, 7, 0)
+                        if sps_idx < 0:
+                            break  # 还没有找到 SPS
+                        if sps_idx > 0:
+                            buffer = buffer[sps_idx:]  # 丢弃 SPS 之前的数据
+                        first_sps_found = True
                         continue
 
-                    # 找到 startcode，检查 NAL 类型
-                    if len(buffer) < 5:
+                    # 找下一个 SPS（从当前位置 +4 开始搜索，跳过当前 SPS）
+                    next_sps_idx = self._find_nal_type(buffer, 7, 5)
+
+                    if next_sps_idx > 0:
+                        # 找到下一个 SPS，提取当前帧
+                        frame_data = buffer[:next_sps_idx]
+                        buffer = buffer[next_sps_idx:]
+
+                        self._send_frame(frame_data)
+                        frame_count += 1
+
+                        # 每秒输出一次日志
+                        now = time.time()
+                        if now - last_log_time >= 1.0:
+                            elapsed = now - self.stats['start_time']
+                            fps = frame_count / elapsed if elapsed > 0 else 0
+                            mbps = (self.stats['bytes_sent'] * 8) / (elapsed * 1000000) if elapsed > 0 else 0
+                            logger.info(f"已发送 {frame_count} 帧, {mbps:.1f} Mbps, {fps:.1f} fps")
+                            last_log_time = now
+                    else:
+                        # 没有找到下一个 SPS，等待更多数据
+                        # 但如果缓冲区太大，强制发送
+                        if len(buffer) > 512 * 1024:  # 512KB
+                            frame_data = buffer
+                            buffer = b''
+                            first_sps_found = False  # 需要重新找 SPS
+                            self._send_frame(frame_data)
+                            frame_count += 1
+                            logger.warning(f"缓冲区溢出，强制发送 {len(frame_data)} bytes")
                         break
-
-                    nal_type = buffer[4] & 0x1F
-
-                    # 如果是新的 Access Unit (SPS/PPS/IDR/AUD)，发送之前累积的帧
-                    # NAL types: 7=SPS, 8=PPS, 5=IDR, 9=AUD, 1=non-IDR
-                    is_new_frame = nal_type in (7, 9)  # SPS 或 AUD 开始新帧
-
-                    if is_new_frame and len(frame_buffer) > 0:
-                        # 发送之前累积的帧
-                        self._send_frame(frame_buffer)
-                        frame_buffer = b''
-
-                    # 查找下一个 startcode
-                    next_idx = buffer.find(NAL_STARTCODE, 4)
-                    if next_idx < 0:
-                        # 没有找到下一个 startcode，需要更多数据
-                        break
-
-                    # 提取当前 NAL 并添加到帧缓冲区
-                    frame_buffer += buffer[:next_idx]
-                    buffer = buffer[next_idx:]
 
             except Exception as e:
                 logger.error(f"发送循环错误: {e}")
+                import traceback
+                traceback.print_exc()
                 break
 
         # 发送剩余数据
-        if frame_buffer:
-            self._send_frame(frame_buffer)
+        if buffer and len(buffer) > 0:
+            self._send_frame(buffer)
+            frame_count += 1
+
+        logger.info(f"发送循环结束, 共发送 {frame_count} 帧")
+
+    def _find_nal_type(self, data: bytes, nal_type: int, start_pos: int = 0) -> int:
+        """
+        在数据中查找特定类型的 NAL 单元
+        返回找到的位置，如果没找到返回 -1
+        """
+        NAL_STARTCODE_4 = b'\x00\x00\x00\x01'
+        NAL_STARTCODE_3 = b'\x00\x00\x01'
+
+        pos = start_pos
+        while pos < len(data) - 4:
+            # 检查 4 字节 startcode
+            if data[pos:pos+4] == NAL_STARTCODE_4:
+                if (data[pos+4] & 0x1F) == nal_type:
+                    return pos
+                pos += 4
+            # 检查 3 字节 startcode
+            elif data[pos:pos+3] == NAL_STARTCODE_3:
+                if (data[pos+3] & 0x1F) == nal_type:
+                    return pos
+                pos += 3
+            else:
+                pos += 1
+
+        return -1
 
     def _send_frame(self, frame_data: bytes):
         """
@@ -681,11 +717,11 @@ class SimpleH264Sender:
             self.stats['frames_sent'] += 1
             self.stats['bytes_sent'] += len(packet)
 
-            if self.stats['frames_sent'] % 30 == 0:  # 每 30 帧打印一次
-                elapsed = time.time() - self.stats['start_time']
-                fps = self.stats['frames_sent'] / elapsed if elapsed > 0 else 0
-                mbps = (self.stats['bytes_sent'] * 8) / (elapsed * 1000000) if elapsed > 0 else 0
-                logger.info(f"已发送 {self.stats['frames_sent']} 帧, {mbps:.1f} Mbps, {fps:.1f} fps")
+            # 前几帧输出详细调试信息
+            if self.stats['frames_sent'] <= 3:
+                # 显示帧的前 20 字节
+                hex_preview = frame_data[:min(20, len(frame_data))].hex()
+                logger.info(f"[Frame {self.stats['frames_sent']}] 大小: {size} bytes, 数据头: {hex_preview}...")
 
         except Exception as e:
             logger.error(f"发送帧失败: {e}")
