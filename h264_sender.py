@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+H.264 视频编码发送器模块
+基于 SteroVR 的 USB 双目相机模块，输出 H.264 编码的 UDP 视频流
+兼容 XRoboToolkit Unity Client 的 MediaDecoder
+
+功能特性:
+1. 复用 SteroVR 的相机采集逻辑
+2. 使用 GStreamer 进行硬件加速 H.264 编码
+3. 通过 UDP 发送 RTP 封装的视频流
+4. 完全兼容 XRoboToolkit-Orin-Video-Sender 协议
+
+依赖安装:
+    # Ubuntu/Debian
+    sudo apt-get install gstreamer1.0-tools gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
+    pip install opencv-python numpy
+
+    # Windows (需要安装 GStreamer)
+    # 下载: https://gstreamer.freedesktop.org/download/
+
+作者: Liang ZHU
+邮箱: lzhu686@connect.hkust-gz.edu.cn
+日期: 2025
+"""
+
+import cv2
+import numpy as np
+import time
+import threading
+import logging
+import subprocess
+import socket
+import struct
+import os
+import sys
+from typing import Optional, Tuple, Callable
+from dataclasses import dataclass
+from enum import Enum
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class EncoderType(Enum):
+    """编码器类型"""
+    SOFTWARE = "software"      # x264 软件编码
+    NVIDIA = "nvidia"          # NVENC 硬件编码
+    VAAPI = "vaapi"            # Intel/AMD VAAPI
+    AUTO = "auto"              # 自动检测
+
+
+@dataclass
+class VideoConfig:
+    """视频配置"""
+    width: int = 2560           # 双目拼接宽度
+    height: int = 720           # 高度
+    fps: int = 60               # 帧率
+    bitrate: int = 8000000      # 码率 (8 Mbps)
+    keyframe_interval: int = 30 # 关键帧间隔
+
+    @property
+    def single_eye_width(self) -> int:
+        """单眼宽度"""
+        return self.width // 2
+
+
+class StereoCamera:
+    """
+    立体相机采集类
+    复用 SteroVR server.py 的相机采集逻辑
+    """
+
+    def __init__(self, config: VideoConfig, device_id: int = 0):
+        self.config = config
+        self.device_id = device_id
+        self.cap: Optional[cv2.VideoCapture] = None
+        self.is_running = False
+        self.frame_lock = threading.Lock()
+        self.latest_frame: Optional[np.ndarray] = None
+        self.frame_id = 0
+        self.capture_thread: Optional[threading.Thread] = None
+
+        # 统计
+        self.stats = {
+            'frames_captured': 0,
+            'fps_actual': 0.0,
+            'last_frame_time': 0.0
+        }
+
+    def initialize(self) -> bool:
+        """初始化相机"""
+        logger.info(f"初始化 USB 双目相机 (设备: {self.device_id})...")
+
+        try:
+            self.cap = cv2.VideoCapture(self.device_id)
+
+            # 设置 MJPG 格式 (减少 USB 带宽)
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
+            self.cap.set(cv2.CAP_PROP_FPS, self.config.fps)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 最小缓冲
+
+            if not self.cap.isOpened():
+                logger.error("无法打开相机设备")
+                return False
+
+            # 验证实际参数
+            actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+
+            logger.info(f"相机配置成功: {actual_w}x{actual_h} @ {actual_fps:.1f}fps")
+
+            # 测试读取
+            ret, frame = self.cap.read()
+            if not ret:
+                logger.error("相机读取测试失败")
+                return False
+
+            logger.info("相机初始化成功")
+            return True
+
+        except Exception as e:
+            logger.error(f"相机初始化异常: {e}")
+            return False
+
+    def start_capture(self):
+        """启动采集线程"""
+        if self.is_running:
+            return
+
+        self.is_running = True
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.capture_thread.start()
+        logger.info("相机采集线程已启动")
+
+    def _capture_loop(self):
+        """采集循环"""
+        frame_interval = 1.0 / self.config.fps
+        frame_count = 0
+        fps_start_time = time.time()
+
+        while self.is_running and self.cap and self.cap.isOpened():
+            loop_start = time.time()
+
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                with self.frame_lock:
+                    self.latest_frame = frame
+                    self.frame_id += 1
+
+                self.stats['frames_captured'] += 1
+                self.stats['last_frame_time'] = time.time()
+                frame_count += 1
+
+                # 每秒更新 FPS
+                if frame_count >= 60:
+                    elapsed = time.time() - fps_start_time
+                    self.stats['fps_actual'] = frame_count / elapsed
+                    frame_count = 0
+                    fps_start_time = time.time()
+
+            # 控制帧率
+            elapsed = time.time() - loop_start
+            if elapsed < frame_interval:
+                time.sleep(frame_interval - elapsed)
+
+    def get_frame(self) -> Tuple[Optional[np.ndarray], int]:
+        """获取最新帧"""
+        with self.frame_lock:
+            if self.latest_frame is not None:
+                return self.latest_frame.copy(), self.frame_id
+            return None, -1
+
+    def stop(self):
+        """停止采集"""
+        self.is_running = False
+        if self.capture_thread:
+            self.capture_thread.join(timeout=2)
+        if self.cap:
+            self.cap.release()
+        logger.info("相机已停止")
+
+
+class H264Encoder:
+    """
+    H.264 编码器
+    使用 GStreamer 进行编码
+    """
+
+    def __init__(self, config: VideoConfig, encoder_type: EncoderType = EncoderType.AUTO):
+        self.config = config
+        self.encoder_type = encoder_type
+        self.process: Optional[subprocess.Popen] = None
+        self.is_running = False
+
+    def _detect_encoder(self) -> str:
+        """检测可用的编码器"""
+        if self.encoder_type == EncoderType.NVIDIA:
+            return "nvh264enc"
+        elif self.encoder_type == EncoderType.VAAPI:
+            return "vaapih264enc"
+        elif self.encoder_type == EncoderType.SOFTWARE:
+            return "x264enc"
+        else:
+            # 自动检测
+            try:
+                # 检查 NVENC
+                result = subprocess.run(['gst-inspect-1.0', 'nvh264enc'],
+                                       capture_output=True, timeout=5)
+                if result.returncode == 0:
+                    logger.info("检测到 NVIDIA 硬件编码器")
+                    return "nvh264enc"
+            except:
+                pass
+
+            try:
+                # 检查 VAAPI
+                result = subprocess.run(['gst-inspect-1.0', 'vaapih264enc'],
+                                       capture_output=True, timeout=5)
+                if result.returncode == 0:
+                    logger.info("检测到 VAAPI 硬件编码器")
+                    return "vaapih264enc"
+            except:
+                pass
+
+            logger.info("使用软件编码器 x264")
+            return "x264enc"
+
+    def _build_pipeline(self, target_ip: str, target_port: int) -> str:
+        """构建 GStreamer pipeline"""
+        encoder = self._detect_encoder()
+
+        # 基础输入
+        pipeline = (
+            f"appsrc name=src format=time is-live=true do-timestamp=true "
+            f"caps=video/x-raw,format=BGR,width={self.config.width},"
+            f"height={self.config.height},framerate={self.config.fps}/1 ! "
+            f"videoconvert ! video/x-raw,format=I420 ! "
+        )
+
+        # 编码器配置
+        bitrate_kbps = self.config.bitrate // 1000
+
+        if encoder == "nvh264enc":
+            pipeline += (
+                f"nvh264enc preset=low-latency-hq bitrate={bitrate_kbps} "
+                f"gop-size={self.config.keyframe_interval} ! "
+            )
+        elif encoder == "vaapih264enc":
+            pipeline += (
+                f"vaapih264enc rate-control=cbr bitrate={bitrate_kbps} "
+                f"keyframe-period={self.config.keyframe_interval} ! "
+            )
+        else:
+            pipeline += (
+                f"x264enc tune=zerolatency speed-preset=ultrafast "
+                f"bitrate={bitrate_kbps} key-int-max={self.config.keyframe_interval} ! "
+            )
+
+        # RTP 封装和 UDP 输出
+        pipeline += (
+            f"h264parse config-interval=1 ! "
+            f"rtph264pay pt=96 config-interval=1 ! "
+            f"udpsink host={target_ip} port={target_port} sync=false"
+        )
+
+        return pipeline
+
+    def start(self, target_ip: str, target_port: int) -> bool:
+        """启动编码器"""
+        try:
+            pipeline = self._build_pipeline(target_ip, target_port)
+            logger.info(f"GStreamer Pipeline: {pipeline}")
+
+            # 启动 GStreamer 进程
+            self.process = subprocess.Popen(
+                ['gst-launch-1.0', '-e'] + pipeline.split(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            self.is_running = True
+            logger.info(f"编码器已启动，输出到 {target_ip}:{target_port}")
+            return True
+
+        except Exception as e:
+            logger.error(f"启动编码器失败: {e}")
+            return False
+
+    def encode_frame(self, frame: np.ndarray) -> bool:
+        """编码一帧"""
+        if not self.is_running or not self.process:
+            return False
+
+        try:
+            # 写入帧数据到 stdin
+            self.process.stdin.write(frame.tobytes())
+            self.process.stdin.flush()
+            return True
+        except Exception as e:
+            logger.error(f"编码帧失败: {e}")
+            return False
+
+    def stop(self):
+        """停止编码器"""
+        self.is_running = False
+        if self.process:
+            self.process.stdin.close()
+            self.process.terminate()
+            self.process.wait(timeout=5)
+        logger.info("编码器已停止")
+
+
+class H264VideoSender:
+    """
+    H.264 视频发送器 (主类)
+    整合相机采集和 H.264 编码
+    """
+
+    def __init__(self, config: Optional[VideoConfig] = None):
+        self.config = config or VideoConfig()
+        self.camera: Optional[StereoCamera] = None
+        self.encoder: Optional[H264Encoder] = None
+        self.is_streaming = False
+        self.send_thread: Optional[threading.Thread] = None
+
+        # 回调
+        self.on_frame_sent: Optional[Callable[[int], None]] = None
+
+        # 统计
+        self.stats = {
+            'frames_sent': 0,
+            'bytes_sent': 0,
+            'start_time': 0.0
+        }
+
+    def initialize(self, device_id: int = 0) -> bool:
+        """初始化发送器"""
+        self.camera = StereoCamera(self.config, device_id)
+        return self.camera.initialize()
+
+    def start_streaming(self, target_ip: str, target_port: int) -> bool:
+        """开始流式传输"""
+        if self.is_streaming:
+            logger.warning("已经在传输中")
+            return False
+
+        if not self.camera:
+            logger.error("相机未初始化")
+            return False
+
+        # 启动相机采集
+        self.camera.start_capture()
+
+        # 创建编码器
+        self.encoder = H264Encoder(self.config)
+        if not self.encoder.start(target_ip, target_port):
+            return False
+
+        # 启动发送线程
+        self.is_streaming = True
+        self.stats['start_time'] = time.time()
+        self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
+        self.send_thread.start()
+
+        logger.info(f"开始向 {target_ip}:{target_port} 发送 H.264 视频流")
+        return True
+
+    def _send_loop(self):
+        """发送循环"""
+        last_frame_id = -1
+
+        while self.is_streaming:
+            frame, frame_id = self.camera.get_frame()
+
+            if frame is not None and frame_id != last_frame_id:
+                if self.encoder.encode_frame(frame):
+                    self.stats['frames_sent'] += 1
+                    self.stats['bytes_sent'] += frame.nbytes
+                    last_frame_id = frame_id
+
+                    if self.on_frame_sent:
+                        self.on_frame_sent(frame_id)
+            else:
+                time.sleep(0.001)
+
+    def stop_streaming(self):
+        """停止传输"""
+        self.is_streaming = False
+
+        if self.send_thread:
+            self.send_thread.join(timeout=2)
+
+        if self.encoder:
+            self.encoder.stop()
+
+        if self.camera:
+            self.camera.stop()
+
+        logger.info("视频流已停止")
+
+    def get_stats(self) -> dict:
+        """获取统计信息"""
+        runtime = time.time() - self.stats['start_time'] if self.stats['start_time'] > 0 else 0
+        return {
+            'frames_sent': self.stats['frames_sent'],
+            'bytes_sent': self.stats['bytes_sent'],
+            'runtime_seconds': runtime,
+            'fps_camera': self.camera.stats['fps_actual'] if self.camera else 0,
+            'avg_fps': self.stats['frames_sent'] / runtime if runtime > 0 else 0
+        }
+
+
+# ============== 简化版: 直接使用 OpenCV VideoWriter + FFmpeg ==============
+
+class SimpleH264Sender:
+    """
+    简化版 H.264 发送器
+    使用 OpenCV + FFmpeg，无需安装 GStreamer
+    适用于快速测试
+    """
+
+    def __init__(self, config: Optional[VideoConfig] = None):
+        self.config = config or VideoConfig()
+        self.cap: Optional[cv2.VideoCapture] = None
+        self.ffmpeg_process: Optional[subprocess.Popen] = None
+        self.is_running = False
+        self.send_thread: Optional[threading.Thread] = None
+
+    def initialize(self, device_id: int = 0) -> bool:
+        """初始化相机"""
+        logger.info(f"初始化相机 (设备: {device_id})...")
+
+        self.cap = cv2.VideoCapture(device_id)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.config.fps)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        if not self.cap.isOpened():
+            logger.error("无法打开相机")
+            return False
+
+        logger.info("相机初始化成功")
+        return True
+
+    def start_streaming(self, target_ip: str, target_port: int) -> bool:
+        """开始流式传输 (使用 FFmpeg)"""
+        if self.is_running:
+            return False
+
+        # FFmpeg 命令
+        # 注意: XRoboToolkit 的 MediaDecoder 期望的是 RTP H.264 流
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{self.config.width}x{self.config.height}',
+            '-r', str(self.config.fps),
+            '-i', '-',  # 从 stdin 读取
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-tune', 'zerolatency',
+            '-b:v', f'{self.config.bitrate // 1000}k',
+            '-g', str(self.config.keyframe_interval),
+            '-f', 'rtp',
+            f'rtp://{target_ip}:{target_port}'
+        ]
+
+        try:
+            self.ffmpeg_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+            self.is_running = True
+            self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
+            self.send_thread.start()
+
+            logger.info(f"开始向 {target_ip}:{target_port} 发送 H.264 流 (FFmpeg)")
+            return True
+
+        except Exception as e:
+            logger.error(f"启动 FFmpeg 失败: {e}")
+            return False
+
+    def _send_loop(self):
+        """发送循环"""
+        frame_interval = 1.0 / self.config.fps
+
+        while self.is_running and self.cap and self.cap.isOpened():
+            loop_start = time.time()
+
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                try:
+                    self.ffmpeg_process.stdin.write(frame.tobytes())
+                except:
+                    break
+
+            elapsed = time.time() - loop_start
+            if elapsed < frame_interval:
+                time.sleep(frame_interval - elapsed)
+
+    def stop_streaming(self):
+        """停止传输"""
+        self.is_running = False
+
+        if self.send_thread:
+            self.send_thread.join(timeout=2)
+
+        if self.ffmpeg_process:
+            self.ffmpeg_process.stdin.close()
+            self.ffmpeg_process.terminate()
+
+        if self.cap:
+            self.cap.release()
+
+        logger.info("视频流已停止")
+
+
+# ============== 测试代码 ==============
+
+def test_simple_sender():
+    """测试简化版发送器"""
+    print("=" * 60)
+    print("H.264 视频发送器测试")
+    print("=" * 60)
+
+    config = VideoConfig(width=2560, height=720, fps=60, bitrate=8000000)
+    sender = SimpleH264Sender(config)
+
+    if not sender.initialize(device_id=0):
+        print("相机初始化失败")
+        return
+
+    target_ip = input("请输入目标 IP (PICO 头显 IP): ").strip() or "192.168.1.100"
+    target_port = int(input("请输入目标端口 (默认 12345): ").strip() or "12345")
+
+    if sender.start_streaming(target_ip, target_port):
+        print(f"\n正在向 {target_ip}:{target_port} 发送视频流...")
+        print("按 Ctrl+C 停止\n")
+
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+
+    sender.stop_streaming()
+    print("测试完成")
+
+
+if __name__ == '__main__':
+    test_simple_sender()
