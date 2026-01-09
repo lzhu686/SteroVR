@@ -481,34 +481,44 @@ class SimpleH264Sender:
         """
         if use_nvenc:
             logger.info(f"使用 NVENC 硬件编码器, 码率: {bitrate_k}kbps")
+            # FFmpeg 4.4 的 NVENC 参数格式
+            # 注意: 需要强制 yuv420p 像素格式以确保兼容性
             return [
+                '-pix_fmt', 'yuv420p',       # 强制 YUV420P，确保解码器兼容
                 '-c:v', 'h264_nvenc',
-                '-preset', 'p1',  # 最低延迟
-                '-tune', 'll',   # low latency
-                '-profile:v', 'baseline',
+                '-preset', 'p1',              # 最低延迟 (FFmpeg 4.x: p1-p7)
+                '-tune', 'll',                # low latency
+                '-profile:v', 'baseline',     # 基线配置，最大兼容性
                 '-level', '5.1',
-                '-rc', 'cbr',
+                '-rc', 'cbr',                 # 恒定码率
                 '-b:v', f'{bitrate_k}k',
                 '-maxrate', f'{bitrate_k}k',
-                '-bufsize', f'{bitrate_k // 8}k',
-                '-g', '1',
+                '-bufsize', f'{bitrate_k // 4}k',  # 增大缓冲区提升清晰度
+                '-g', '1',                    # GOP=1，每帧都是关键帧
                 '-keyint_min', '1',
             ]
         else:
             logger.info(f"使用 libx264 软件编码器, 码率: {bitrate_k}kbps")
+            # 清晰度优化说明:
+            # - preset: ultrafast(最快/最差) < superfast < veryfast < faster < fast < medium(默认/最好)
+            #   提升到 superfast 可改善清晰度，但会增加 CPU 负载
+            # - profile: baseline(最简单) < main < high(压缩效率最好)
+            #   baseline 兼容性最好，但压缩效率低约 15%
+            # - bufsize: 越大允许码率波动越大，复杂场景更清晰
+            #   当前 bitrate/4 (约 5Mbit)，可增大到 bitrate/2 获得更好质量
             return [
                 '-c:v', 'libx264',
-                '-preset', 'ultrafast',
+                '-preset', 'superfast',      # 从 ultrafast 提升到 superfast，清晰度更好
                 '-tune', 'zerolatency',
-                '-profile:v', 'baseline',
+                '-profile:v', 'main',        # 从 baseline 提升到 main，压缩效率更高
                 '-level', '5.1',
                 '-b:v', f'{bitrate_k}k',
-                '-maxrate', f'{bitrate_k}k',
-                '-minrate', f'{bitrate_k}k',
-                '-bufsize', f'{bitrate_k // 8}k',
+                '-maxrate', f'{int(bitrate_k * 1.2)}k',  # 允许峰值超出 20%
+                '-minrate', f'{int(bitrate_k * 0.8)}k',  # 允许低谷到 80%
+                '-bufsize', f'{bitrate_k // 4}k',        # 增大缓冲区，从 /8 改为 /4
                 '-g', '1',
                 '-keyint_min', '1',
-                '-x264-params', 'repeat-headers=1:nal-hrd=cbr',
+                '-x264-params', 'repeat-headers=1',
             ]
 
     def initialize(self, device_id: int = 0) -> bool:
