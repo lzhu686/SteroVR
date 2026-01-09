@@ -482,7 +482,7 @@ class SimpleH264Sender:
         if use_nvenc:
             logger.info(f"使用 NVENC 硬件编码器, 码率: {bitrate_k}kbps")
             # FFmpeg 4.4 的 NVENC 参数格式
-            # 注意: 需要强制 yuv420p 像素格式以确保兼容性
+            # 实时遥操作优化: 延迟优先，清晰度其次
             return [
                 '-pix_fmt', 'yuv420p',       # 强制 YUV420P，确保解码器兼容
                 '-c:v', 'h264_nvenc',
@@ -493,9 +493,11 @@ class SimpleH264Sender:
                 '-rc', 'cbr',                 # 恒定码率
                 '-b:v', f'{bitrate_k}k',
                 '-maxrate', f'{bitrate_k}k',
-                '-bufsize', f'{bitrate_k // 4}k',  # 增大缓冲区提升清晰度
+                '-bufsize', f'{bitrate_k // 15}k',  # 约1.4Mbit，低延迟关键参数
                 '-g', '1',                    # GOP=1，每帧都是关键帧
                 '-keyint_min', '1',
+                '-delay', '0',                # 零延迟
+                '-zerolatency', '1',          # NVENC 零延迟模式
             ]
         else:
             logger.info(f"使用 libx264 软件编码器, 码率: {bitrate_k}kbps")
