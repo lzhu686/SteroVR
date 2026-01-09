@@ -54,10 +54,10 @@ class EncoderType(Enum):
 @dataclass
 class VideoConfig:
     """视频配置"""
-    width: int = 2560           # 双目拼接宽度
-    height: int = 720           # 高度
-    fps: int = 60               # 帧率
-    bitrate: int = 8000000      # 码率 (8 Mbps)
+    width: int = 1920           # 双目拼接宽度 (单眼960)
+    height: int = 1080          # 高度
+    fps: int = 30               # 帧率 (30fps降低编码压力)
+    bitrate: int = 15000000     # 码率 (15 Mbps，减少块效应)
     keyframe_interval: int = 30 # 关键帧间隔
 
     @property
@@ -514,7 +514,8 @@ class SimpleH264Sender:
             return False
 
         # FFmpeg 命令 - 输出 H.264 annex-b 格式到 stdout
-        # 使用GOP=1确保每帧都是关键帧，方便分割和解码
+        # 优化参数：CBR恒定码率 + 低延迟 + 高质量
+        bitrate_k = self.config.bitrate // 1000
         ffmpeg_cmd = [
             'ffmpeg',
             '-y',
@@ -523,19 +524,24 @@ class SimpleH264Sender:
             '-pix_fmt', 'bgr24',
             '-s', f'{self.config.width}x{self.config.height}',
             '-r', str(self.config.fps),
-            '-i', '-',  # 从 stdin 读取
-            '-vf', 'format=yuv420p',  # 转换为 YUV 4:2:0
+            '-i', '-',
+            '-vf', 'format=yuv420p',
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
             '-tune', 'zerolatency',
-            '-profile:v', 'baseline',  # 使用 baseline profile
-            '-level', '4.0',
-            '-b:v', '4000k',  # 4Mbps (与官方一致)
-            '-g', '1',  # 每帧都是关键帧
+            '-profile:v', 'baseline',
+            '-level', '4.1',
+            # CBR 恒定码率配置
+            '-b:v', f'{bitrate_k}k',
+            '-maxrate', f'{bitrate_k}k',
+            '-minrate', f'{bitrate_k}k',
+            '-bufsize', f'{bitrate_k // 2}k',  # 缓冲区=码率的一半，降低延迟
+            # 关键帧配置
+            '-g', '1',
             '-keyint_min', '1',
-            '-x264-params', 'repeat-headers=1',  # 每帧带 SPS/PPS
-            '-f', 'h264',  # 输出原始 H.264 Annexb 流
-            '-'  # 输出到 stdout
+            '-x264-params', 'repeat-headers=1:nal-hrd=cbr',  # CBR + 每帧带SPS/PPS
+            '-f', 'h264',
+            '-'
         ]
 
         try:
@@ -752,47 +758,6 @@ class SimpleH264Sender:
         except Exception as e:
             logger.error(f"发送帧失败: {e}")
             self.is_running = False
-
-    def _split_nal_units(self, data: bytes) -> list:
-        """
-        将H.264 Annexb流分割成独立的NAL单元（不含startcode）
-        """
-        nal_units = []
-        NAL_START_4 = b'\x00\x00\x00\x01'
-        NAL_START_3 = b'\x00\x00\x01'
-
-        # 找到所有NAL起始位置
-        positions = []
-        pos = 0
-        while pos < len(data) - 3:
-            if data[pos:pos+4] == NAL_START_4:
-                positions.append((pos, 4))
-                pos += 4
-            elif data[pos:pos+3] == NAL_START_3:
-                positions.append((pos, 3))
-                pos += 3
-            else:
-                pos += 1
-
-        # 提取每个NAL单元的数据（不含startcode）
-        for i, (start_pos, startcode_len) in enumerate(positions):
-            nal_start = start_pos + startcode_len
-            if i + 1 < len(positions):
-                nal_end = positions[i + 1][0]
-            else:
-                nal_end = len(data)
-
-            nal_data = data[nal_start:nal_end]
-            if nal_data:
-                nal_units.append(nal_data)
-
-        return nal_units
-
-    def _send_nal_unit(self, nal_data: bytes):
-        """
-        发送单个 NAL 单元 (已废弃，保留兼容)
-        """
-        self._send_frame(nal_data)
 
     def stop_streaming(self):
         """停止传输"""
