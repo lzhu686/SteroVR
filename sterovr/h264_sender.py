@@ -53,12 +53,23 @@ class EncoderType(Enum):
 
 @dataclass
 class VideoConfig:
-    """视频配置"""
-    width: int = 1920           # 双目拼接宽度 (单眼960)
-    height: int = 1080          # 高度
-    fps: int = 30               # 帧率 (30fps降低编码压力)
-    bitrate: int = 15000000     # 码率 (15 Mbps，减少块效应)
-    keyframe_interval: int = 30 # 关键帧间隔
+    """
+    视频配置 - 双臂灵巧手遥操作极致性能
+
+    相机: HBVCAM-F2439GS-2 V11 (AR0234 全局快门)
+    场景: 双臂灵巧手精细操作
+
+    设计原则:
+    1. 60fps: 手指快速移动时保持清晰
+    2. 720p: 匹配相机原生分辨率，编码效率高
+    3. 20Mbps: 高码率保证画质，每帧333Kbit
+    4. GOP=1: 每帧独立，训练数据可用
+    """
+    width: int = 2560            # 双目总宽度 (相机原生 MJPEG 2560x720@60fps)
+    height: int = 720            # 高度
+    fps: int = 60                # 60fps - 灵巧手快速运动需要高帧率
+    bitrate: int = 20000000      # 20Mbps - 高质量，每帧333Kbit
+    keyframe_interval: int = 1   # GOP=1 - 每帧独立
 
     @property
     def single_eye_width(self) -> int:
