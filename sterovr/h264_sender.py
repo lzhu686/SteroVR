@@ -54,21 +54,22 @@ class EncoderType(Enum):
 @dataclass
 class VideoConfig:
     """
-    视频配置 - 双臂灵巧手遥操作极致性能
+    视频配置 - 双臂灵巧手遥操作极致性能 (官方推荐配置)
 
     相机: HBVCAM-F2439GS-2 V11 (AR0234 全局快门)
-    场景: 双臂灵巧手精细操作
+    场景: 双臂灵巧手精细操作，深度感知精度最大化
 
     设计原则:
-    1. 60fps: 手指快速移动时保持清晰
-    2. 720p: 匹配相机原生分辨率，编码效率高
-    3. 20Mbps: 高码率保证画质，每帧333Kbit
+    1. 3840x1080: 官方推荐分辨率，单眼1920x1080
+    2. 60fps: 手指快速移动时保持清晰 (MJPEG 3840x1080@60fps)
+    3. 35Mbps: 高码率保证画质，每帧583Kbit
     4. GOP=1: 每帧独立，训练数据可用
+    5. 深度感知: 横向1920像素，比720p提升50%
     """
-    width: int = 2560            # 双目总宽度 (相机原生 MJPEG 2560x720@60fps)
-    height: int = 720            # 高度
+    width: int = 3840            # 双目总宽度 (官方推荐 MJPEG 3840x1080@60fps)
+    height: int = 1080           # 1080p - 官方推荐，深度感知最优
     fps: int = 60                # 60fps - 灵巧手快速运动需要高帧率
-    bitrate: int = 20000000      # 20Mbps - 高质量，每帧333Kbit
+    bitrate: int = 36700160      # 35Mbps - 高质量，每帧583Kbit (35 x 1024 x 1024)
     keyframe_interval: int = 1   # GOP=1 - 每帧独立
 
     @property
