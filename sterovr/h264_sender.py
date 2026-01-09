@@ -542,12 +542,12 @@ class SimpleH264Sender:
             '-preset', 'ultrafast',
             '-tune', 'zerolatency',
             '-profile:v', 'baseline',
-            '-level', '4.1',
-            # CBR 恒定码率配置
+            '-level', '5.1',  # Level 5.1: 支持高分辨率+高帧率，兼容性好
+            # CBR 恒定码率配置 - 稳定延迟，避免卡顿
             '-b:v', f'{bitrate_k}k',
             '-maxrate', f'{bitrate_k}k',
             '-minrate', f'{bitrate_k}k',
-            '-bufsize', f'{bitrate_k // 2}k',  # 缓冲区=码率的一半，降低延迟
+            '-bufsize', f'{bitrate_k // 8}k',  # 缓冲区=码率/8，极低延迟，画面更锐利
             # 关键帧配置
             '-g', '1',
             '-keyint_min', '1',
