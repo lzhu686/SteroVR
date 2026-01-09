@@ -458,29 +458,144 @@ class SimpleH264Sender:
             'start_time': 0.0
         }
 
+    def _check_nvenc_available(self) -> bool:
+        """检测是否有NVIDIA硬件编码器可用"""
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-hide_banner', '-encoders'],
+                capture_output=True, text=True, timeout=5
+            )
+            if 'h264_nvenc' in result.stdout:
+                logger.info("检测到 NVIDIA NVENC 硬件编码器")
+                return True
+        except Exception as e:
+            logger.debug(f"检测NVENC失败: {e}")
+        return False
+
+    def _get_encoder_args(self, bitrate_k: int, use_nvenc: bool) -> list:
+        """
+        获取编码器参数
+
+        NVENC (硬件编码): 更快，CPU占用低
+        libx264 (软件编码): 通用，但CPU占用高
+        """
+        if use_nvenc:
+            logger.info(f"使用 NVENC 硬件编码器, 码率: {bitrate_k}kbps")
+            return [
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p1',  # 最低延迟
+                '-tune', 'll',   # low latency
+                '-profile:v', 'baseline',
+                '-level', '5.1',
+                '-rc', 'cbr',
+                '-b:v', f'{bitrate_k}k',
+                '-maxrate', f'{bitrate_k}k',
+                '-bufsize', f'{bitrate_k // 8}k',
+                '-g', '1',
+                '-keyint_min', '1',
+            ]
+        else:
+            logger.info(f"使用 libx264 软件编码器, 码率: {bitrate_k}kbps")
+            return [
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-profile:v', 'baseline',
+                '-level', '5.1',
+                '-b:v', f'{bitrate_k}k',
+                '-maxrate', f'{bitrate_k}k',
+                '-minrate', f'{bitrate_k}k',
+                '-bufsize', f'{bitrate_k // 8}k',
+                '-g', '1',
+                '-keyint_min', '1',
+                '-x264-params', 'repeat-headers=1:nal-hrd=cbr',
+            ]
+
     def initialize(self, device_id: int = 0) -> bool:
         """初始化相机"""
         logger.info(f"初始化相机 (设备: {device_id})...")
 
-        self.cap = cv2.VideoCapture(device_id)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.config.fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # 保存设备ID供后续FFmpeg直接读取
+        self.device_id = device_id
 
-        if not self.cap.isOpened():
+        # 先用OpenCV测试相机是否可用并获取实际参数
+        test_cap = cv2.VideoCapture(device_id)
+        test_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        test_cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
+        test_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
+        test_cap.set(cv2.CAP_PROP_FPS, self.config.fps)
+
+        if not test_cap.isOpened():
             logger.error("无法打开相机")
             return False
 
         # 验证实际参数
-        actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        actual_w = int(test_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(test_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = test_cap.get(cv2.CAP_PROP_FPS)
         logger.info(f"相机配置: {actual_w}x{actual_h} @ {actual_fps:.1f}fps")
 
-        logger.info("相机初始化成功")
+        # 保存实际帧率
+        self.actual_fps = actual_fps
+
+        # 关闭测试连接，让FFmpeg独占相机
+        test_cap.release()
+
+        # Windows需要获取相机名称用于DirectShow
+        if sys.platform == 'win32':
+            self.camera_name = self._get_windows_camera_name(device_id)
+            if not self.camera_name:
+                logger.warning(f"无法获取相机名称，使用默认: video={device_id}")
+                self.camera_name = f"video={device_id}"
+
+        # 不再使用 self.cap，改用 FFmpeg 直接读取相机
+        self.cap = None
+
+        logger.info("相机初始化成功 (将使用FFmpeg直接采集)")
         return True
+
+    def _get_windows_camera_name(self, device_id: int) -> Optional[str]:
+        """
+        获取Windows上的相机名称用于DirectShow
+        使用ffmpeg -list_devices来获取设备列表
+        """
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-hide_banner', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'],
+                capture_output=True, text=True, timeout=10
+            )
+            # 解析输出找到视频设备
+            lines = result.stderr.split('\n')
+            video_devices = []
+            in_video_section = False
+
+            for line in lines:
+                if 'DirectShow video devices' in line:
+                    in_video_section = True
+                    continue
+                if 'DirectShow audio devices' in line:
+                    in_video_section = False
+                    continue
+                if in_video_section and '"' in line:
+                    # 提取设备名称
+                    import re
+                    match = re.search(r'"([^"]+)"', line)
+                    if match and 'Alternative name' not in line:
+                        video_devices.append(match.group(1))
+
+            if device_id < len(video_devices):
+                camera_name = f'video={video_devices[device_id]}'
+                logger.info(f"找到相机: {camera_name}")
+                return camera_name
+            elif video_devices:
+                camera_name = f'video={video_devices[0]}'
+                logger.warning(f"设备ID {device_id} 超出范围，使用第一个相机: {camera_name}")
+                return camera_name
+
+        except Exception as e:
+            logger.warning(f"获取Windows相机名称失败: {e}")
+
+        return None
 
     def start_streaming(self, target_ip: str, target_port: int) -> bool:
         """
@@ -488,7 +603,7 @@ class SimpleH264Sender:
 
         工作流程:
         1. 连接到 Unity Client 的 MediaDecoder TCP 服务
-        2. 使用 FFmpeg 编码 H.264
+        2. 使用 FFmpeg 直接从相机读取 MJPEG 并转码为 H.264
         3. 读取 FFmpeg 输出的 H.264 NAL 单元
         4. 封装为 [length:4][data] 格式发送
         """
@@ -525,45 +640,57 @@ class SimpleH264Sender:
         if not connected:
             return False
 
-        # FFmpeg 命令 - 输出 H.264 annex-b 格式到 stdout
-        # 优化参数：CBR恒定码率 + 低延迟 + 高质量
+        # FFmpeg 命令 - 直接从相机读取 MJPEG 并转码为 H.264
+        # 优化: 跳过 OpenCV 解码，减少 CPU 开销
         bitrate_k = self.config.bitrate // 1000
+
+        # 使用实际帧率（相机可能不支持60fps）
+        actual_fps = int(getattr(self, 'actual_fps', self.config.fps))
+        if actual_fps < self.config.fps:
+            logger.warning(f"相机实际帧率 {actual_fps}fps < 请求的 {self.config.fps}fps，使用实际帧率")
+
+        # 检测是否有NVIDIA硬件编码器
+        use_nvenc = self._check_nvenc_available()
+        encoder_args = self._get_encoder_args(bitrate_k, use_nvenc)
+
+        # 根据操作系统构建输入参数
+        if sys.platform == 'win32':
+            # Windows: 使用 DirectShow
+            # 需要先获取相机名称
+            camera_name = getattr(self, 'camera_name', f'video={self.device_id}')
+            input_args = [
+                '-f', 'dshow',
+                '-video_size', f'{self.config.width}x{self.config.height}',
+                '-framerate', str(actual_fps),
+                '-vcodec', 'mjpeg',  # 请求MJPEG格式
+                '-i', camera_name,
+            ]
+        else:
+            # Linux: 使用 V4L2
+            input_args = [
+                '-f', 'v4l2',
+                '-input_format', 'mjpeg',
+                '-video_size', f'{self.config.width}x{self.config.height}',
+                '-framerate', str(actual_fps),
+                '-i', f'/dev/video{self.device_id}',
+            ]
+
         ffmpeg_cmd = [
             'ffmpeg',
             '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            '-s', f'{self.config.width}x{self.config.height}',
-            '-r', str(self.config.fps),
-            '-i', '-',
-            '-vf', 'format=yuv420p',
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-tune', 'zerolatency',
-            '-profile:v', 'baseline',
-            '-level', '5.1',  # Level 5.1: 支持高分辨率+高帧率，兼容性好
-            # CBR 恒定码率配置 - 稳定延迟，避免卡顿
-            '-b:v', f'{bitrate_k}k',
-            '-maxrate', f'{bitrate_k}k',
-            '-minrate', f'{bitrate_k}k',
-            '-bufsize', f'{bitrate_k // 8}k',  # 缓冲区=码率/8，极低延迟，画面更锐利
-            # 关键帧配置
-            '-g', '1',
-            '-keyint_min', '1',
-            '-x264-params', 'repeat-headers=1:nal-hrd=cbr',  # CBR + 每帧带SPS/PPS
+        ] + input_args + encoder_args + [
             '-f', 'h264',
             '-'
         ]
 
         try:
-            logger.info(f"启动 FFmpeg 编码器...")
+            logger.info(f"启动 FFmpeg 编码器 (直接读取相机)...")
             logger.info(f"FFmpeg 命令: {' '.join(ffmpeg_cmd)}")
             self.ffmpeg_process = subprocess.Popen(
                 ffmpeg_cmd,
-                stdin=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,  # 不需要stdin，FFmpeg直接读取相机
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE  # 捕获错误输出以便调试
+                stderr=subprocess.PIPE
             )
 
             # 启动一个线程来读取 stderr
@@ -585,11 +712,7 @@ class SimpleH264Sender:
         self.stats['frames_sent'] = 0
         self.stats['bytes_sent'] = 0
 
-        # 启动采集线程 (写入 FFmpeg stdin)
-        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self.capture_thread.start()
-
-        # 启动发送线程 (从 FFmpeg stdout 读取并发送)
+        # 只需要发送线程 (FFmpeg 自己从相机读取)
         self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
         self.send_thread.start()
 
