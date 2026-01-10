@@ -629,11 +629,6 @@ class XRoboCompatServer:
         if self.video_sender.start_streaming(request.ip, request.port):
             logger.info("视频流已启动")
 
-            # WiFi 模式下启用动态码率调整
-            if not self.adb_connected:
-                self.video_sender.enable_dynamic_bitrate(True)
-                logger.info("📶 WiFi 模式: 已启用动态码率调整")
-
             # 发送成功响应
             response = PacketParser.build_response(
                 ProtocolConstants.CMD_FUNCTION,
@@ -694,11 +689,6 @@ class XRoboCompatServer:
 
         if self.video_sender.start_streaming(target_ip, target_port):
             logger.info("视频流已启动")
-
-            # WiFi 模式下启用动态码率调整
-            if not self.adb_connected:
-                self.video_sender.enable_dynamic_bitrate(True)
-                logger.info("📶 WiFi 模式: 已启用动态码率调整")
 
             if self.on_streaming_started:
                 self.on_streaming_started(target_ip, target_port)

@@ -59,15 +59,6 @@ class StreamingConstants:
     SEND_TIMEOUT_SECONDS = 5        # TCP 发送超时 (秒)
     CONNECTION_LOST_THRESHOLD = 2   # 连续发送失败次数，触发连接断开回调
 
-    # 动态码率调整参数
-    BITRATE_CHECK_INTERVAL = 2.0    # 码率检测间隔 (秒)
-    SEND_TIME_HIGH_THRESHOLD = 50   # 发送耗时高阈值 (ms)，超过则降码率
-    SEND_TIME_LOW_THRESHOLD = 10    # 发送耗时低阈值 (ms)，低于则可升码率
-    BITRATE_DECREASE_RATIO = 0.7    # 降码率比例 (降至 70%)
-    BITRATE_INCREASE_RATIO = 1.2    # 升码率比例 (升至 120%)
-    BITRATE_MIN_MBPS = 4            # 最低码率 (Mbps)
-    BITRATE_STABLE_COUNT = 5        # 连续稳定次数后才升码率
-
 
 @dataclass
 class VideoConfig:
@@ -146,20 +137,10 @@ class SimpleH264Sender:
             'start_time': 0.0,
             'last_frame_time': 0.0,
             'connection_lost_count': 0,
-            'bitrate_decrease_count': 0,  # 降码率次数
-            'bitrate_increase_count': 0,  # 升码率次数
         }
 
         # 网络状态监控 (仅用于统计日志)
         self._send_times = deque(maxlen=30)  # 最近 30 帧的发送耗时
-
-        # 动态码率调整
-        self._dynamic_bitrate_enabled = False  # 是否启用动态码率
-        self._current_bitrate = self.config.bitrate  # 当前实际码率
-        self._initial_bitrate = self.config.bitrate  # 初始码率 (用于恢复)
-        self._last_bitrate_check = 0.0  # 上次码率检测时间
-        self._stable_count = 0  # 连续稳定计数
-        self._bitrate_lock = threading.Lock()  # 码率调整锁
 
     # ============== 编码器检测与配置 ==============
 
@@ -186,50 +167,56 @@ class SimpleH264Sender:
 
     def _get_encoder_args(self, bitrate_k: int, use_nvenc: bool) -> list:
         """
-        获取编码器参数 (画质优化)
+        获取编码器参数 (画质优化版)
 
         参数说明:
-        - profile high: CABAC 压缩效率提升 15-20%
-        - preset p4: NVENC 平衡预设，画质与速度兼顾
-        - spatial-aq: 自适应量化，减少块效应
-        - temporal-aq: 时间域自适应，减少闪烁
-        - bufsize bitrate/20: 保持小缓冲
+        - pix_fmt yuv420p: 最通用的像素格式
+        - profile high: 启用 CABAC + 8x8 变换，画质提升 15-20%
+        - bufsize: 增大到 bitrate/4，给编码器更多码率缓冲
+        - AQ (自适应量化): 提升细节保留，减少闪烁
 
-        设计原则: WiFi 场景画质优先，接受偶尔卡顿
+        画质 vs 延迟权衡:
+        - preset p4 比 p1 画质好 10-15%，延迟增加约 3ms
+        - high profile 比 baseline 画质好 15-20%，解码延迟增加约 2ms
+        - 总延迟增加约 10ms (50ms → 60ms)，对遥操作仍可接受
         """
         if use_nvenc:
             logger.info(f"使用 NVENC 硬件编码器 (画质优化), 码率: {bitrate_k} kbps")
             return [
                 '-pix_fmt', 'yuv420p',
                 '-c:v', 'h264_nvenc',
-                '-preset', 'p4',               # 平衡预设 (之前 p1)
-                '-profile:v', 'high',          # 高压缩效率 (之前 baseline)
-                '-level', '4.2',               # 足够 2560x720@60fps
+                '-preset', 'p4',               # 平衡质量和速度 (p1最快p7最好)
+                '-tune', 'll',                 # low latency 调优
+                '-profile:v', 'high',          # 画质优先 (启用 CABAC)
+                '-level', '5.1',
                 '-rc', 'cbr',
                 '-b:v', f'{bitrate_k}k',
                 '-maxrate', f'{bitrate_k}k',
-                '-bufsize', f'{bitrate_k // 20}k',
-                '-g', '1',                     # GOP=1 保持
+                '-bufsize', f'{bitrate_k // 4}k',  # 5Mbit 缓冲，画质更稳定
+                '-g', '1',
                 '-keyint_min', '1',
-                '-spatial-aq', '1',            # 自适应量化，减少块效应
-                '-temporal-aq', '1',           # 时间域自适应，减少闪烁
-                '-aq-strength', '8',           # AQ 强度
+                '-delay', '0',
+                '-zerolatency', '1',
+                # 画质增强
+                '-spatial-aq', '1',            # 空间自适应量化
+                '-temporal-aq', '1',           # 时间自适应量化
+                '-aq-strength', '8',           # AQ 强度 (1-15)
             ]
         else:
             logger.info(f"使用 libx264 软件编码器 (画质优化), 码率: {bitrate_k} kbps")
             return [
                 '-pix_fmt', 'yuv420p',
                 '-c:v', 'libx264',
-                '-preset', 'fast',             # 平衡预设 (之前 ultrafast)
-                '-profile:v', 'high',          # 高压缩效率 (之前 baseline)
-                '-level', '4.2',
+                '-preset', 'faster',           # 画质更好 (比 veryfast)
+                '-tune', 'zerolatency',
+                '-profile:v', 'high',          # 画质优先
+                '-level', '5.1',
                 '-b:v', f'{bitrate_k}k',
                 '-maxrate', f'{bitrate_k}k',
-                '-bufsize', f'{bitrate_k // 20}k',
+                '-bufsize', f'{bitrate_k // 4}k',
                 '-g', '1',
                 '-keyint_min', '1',
-                '-aq-mode', '2',               # 方差自适应量化
-                '-aq-strength', '1.0',
+                '-x264-params', 'repeat-headers=1:aq-mode=2:aq-strength=1.0',
             ]
 
     # ============== 相机初始化 ==============
@@ -350,17 +337,8 @@ class SimpleH264Sender:
             'start_time': time.time(),
             'last_frame_time': 0.0,
             'connection_lost_count': 0,
-            'bitrate_decrease_count': 0,
-            'bitrate_increase_count': 0,
         }
         self._consecutive_send_failures = 0
-
-        # 重置动态码率状态
-        self._current_bitrate = self.config.bitrate
-        self._initial_bitrate = self.config.bitrate
-        self._last_bitrate_check = 0.0
-        self._stable_count = 0
-
         self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
         self.send_thread.start()
 
@@ -530,17 +508,9 @@ class SimpleH264Sender:
                             mbps = (self.stats['bytes_sent'] * 8) / (elapsed * 1_000_000) if elapsed > 0 else 0
                             avg_send_ms = self.get_network_stats()['avg_send_time_ms']
 
-                            # 显示当前码率 (如果启用了动态调整)
-                            bitrate_info = ""
-                            if self._dynamic_bitrate_enabled:
-                                bitrate_info = f" | 码率:{self._current_bitrate // 1_000_000}Mbps"
-
                             logger.info(f"帧:{frame_count} | {mbps:.1f}Mbps | {fps:.1f}fps | "
-                                        f"发送耗时:{avg_send_ms:.1f}ms{bitrate_info}")
+                                        f"发送耗时:{avg_send_ms:.1f}ms")
                             last_log_time = now
-
-                            # 检查是否需要调整码率
-                            self._check_and_adjust_bitrate()
                     else:
                         # 缓冲区溢出保护
                         if len(buffer) > StreamingConstants.MAX_BUFFER_SIZE:
@@ -688,114 +658,6 @@ class SimpleH264Sender:
             'max_send_time_ms': max(self._send_times),
         }
 
-    # ============== 动态码率调整 ==============
-
-    def enable_dynamic_bitrate(self, enabled: bool = True):
-        """
-        启用/禁用动态码率调整
-
-        动态码率调整策略 (WiFi 遥操作优化):
-        - 当发送耗时持续 > 50ms: 降低码率至 70%
-        - 当发送耗时持续 < 10ms: 逐步恢复码率
-        - 最低码率: 4 Mbps (保证基本画质)
-
-        注意: 码率调整需要重启 FFmpeg 进程，会有短暂黑屏 (~100ms)
-        """
-        self._dynamic_bitrate_enabled = enabled
-        if enabled:
-            logger.info(f"✅ 动态码率调整已启用 (初始: {self._current_bitrate // 1_000_000}Mbps)")
-        else:
-            logger.info("❌ 动态码率调整已禁用")
-
-    def _check_and_adjust_bitrate(self):
-        """
-        检查网络状态并调整码率
-
-        调用时机: 发送循环中定期调用
-        调整策略:
-        1. 发送耗时 > HIGH_THRESHOLD: 降码率 (立即)
-        2. 发送耗时 < LOW_THRESHOLD 且连续 STABLE_COUNT 次: 升码率 (保守)
-        """
-        if not self._dynamic_bitrate_enabled:
-            return
-
-        now = time.time()
-        if now - self._last_bitrate_check < StreamingConstants.BITRATE_CHECK_INTERVAL:
-            return
-
-        self._last_bitrate_check = now
-
-        # 获取平均发送耗时
-        if len(self._send_times) < 10:
-            return  # 样本不足
-
-        avg_send_time = sum(self._send_times) / len(self._send_times)
-
-        with self._bitrate_lock:
-            old_bitrate = self._current_bitrate
-
-            if avg_send_time > StreamingConstants.SEND_TIME_HIGH_THRESHOLD:
-                # 网络拥塞，降低码率
-                new_bitrate = int(self._current_bitrate * StreamingConstants.BITRATE_DECREASE_RATIO)
-                min_bitrate = StreamingConstants.BITRATE_MIN_MBPS * 1_000_000
-
-                if new_bitrate < min_bitrate:
-                    new_bitrate = min_bitrate
-
-                if new_bitrate < self._current_bitrate:
-                    self._current_bitrate = new_bitrate
-                    self._stable_count = 0
-                    self.stats['bitrate_decrease_count'] += 1
-                    logger.warning(f"⬇️ 网络拥塞 (发送耗时: {avg_send_time:.1f}ms), "
-                                   f"降低码率: {old_bitrate // 1_000_000}Mbps → {new_bitrate // 1_000_000}Mbps")
-                    self._restart_ffmpeg_with_new_bitrate()
-
-            elif avg_send_time < StreamingConstants.SEND_TIME_LOW_THRESHOLD:
-                # 网络良好，考虑恢复码率
-                self._stable_count += 1
-
-                if self._stable_count >= StreamingConstants.BITRATE_STABLE_COUNT:
-                    if self._current_bitrate < self._initial_bitrate:
-                        new_bitrate = int(self._current_bitrate * StreamingConstants.BITRATE_INCREASE_RATIO)
-
-                        if new_bitrate > self._initial_bitrate:
-                            new_bitrate = self._initial_bitrate
-
-                        self._current_bitrate = new_bitrate
-                        self._stable_count = 0
-                        self.stats['bitrate_increase_count'] += 1
-                        logger.info(f"⬆️ 网络良好 (发送耗时: {avg_send_time:.1f}ms), "
-                                    f"恢复码率: {old_bitrate // 1_000_000}Mbps → {new_bitrate // 1_000_000}Mbps")
-                        self._restart_ffmpeg_with_new_bitrate()
-            else:
-                # 中间状态，保持当前码率
-                self._stable_count = 0
-
-    def _restart_ffmpeg_with_new_bitrate(self):
-        """
-        用新码率重启 FFmpeg 进程
-
-        策略: 先启动新进程，再终止旧进程，最小化黑屏时间
-        """
-        if not self.ffmpeg_process:
-            return
-
-        logger.info(f"🔄 重启 FFmpeg (新码率: {self._current_bitrate // 1_000_000}Mbps)...")
-
-        # 终止旧进程
-        old_process = self.ffmpeg_process
-        old_process.terminate()
-        try:
-            old_process.wait(timeout=1)
-        except:
-            old_process.kill()
-
-        # 更新配置并启动新进程
-        self.config.bitrate = self._current_bitrate
-        self._start_ffmpeg()
-
-        logger.info("✅ FFmpeg 重启完成")
-
     # ============== 清理 ==============
 
     def stop_streaming(self):
@@ -833,9 +695,6 @@ class SimpleH264Sender:
         logger.info(f"  平均帧率: {self.stats['frames_sent'] / elapsed:.1f} fps" if elapsed > 0 else "  平均帧率: N/A")
         logger.info(f"  平均发送耗时: {net_stats['avg_send_time_ms']:.1f} ms")
         logger.info(f"  最大发送耗时: {net_stats['max_send_time_ms']:.1f} ms")
-        if self._dynamic_bitrate_enabled:
-            logger.info(f"  动态码率调整: 降 {self.stats['bitrate_decrease_count']} 次, 升 {self.stats['bitrate_increase_count']} 次")
-            logger.info(f"  最终码率: {self._current_bitrate // 1_000_000} Mbps")
         logger.info("=" * 60)
 
 
