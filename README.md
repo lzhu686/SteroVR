@@ -23,11 +23,12 @@ StereoVR 是一个 USB 双目相机流媒体库，支持将双目视频实时传
 
 | 特性 | WebSocket 模式 | XRoboToolkit 模式 |
 |------|----------------|-------------------|
-| 协议 | WSS (Base64 JPEG) | UDP RTP H.264 |
+| 协议 | WSS (Base64 JPEG) | TCP H.264 (NVENC) |
 | 延迟 | ~80-150ms | **~30-50ms** |
 | 客户端 | 任意 WebXR 浏览器 | XRoboToolkit Unity |
 | 设备支持 | Quest/PICO/Vision Pro | PICO |
 | 适用场景 | 演示/调试 | **遥操作(推荐)** |
+| 连接方式 | WiFi | USB ADB / WiFi |
 
 ---
 
@@ -90,26 +91,31 @@ python start_xrobo_compat.py
 3. **TCP 重传** - 丢包需要重传，增加延迟抖动
 4. **JS 解码** - 浏览器 JavaScript 解码效率较低
 
-#### UDP RTP H.264 模式的延迟分析
+#### TCP H.264 模式的延迟分析
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  UDP RTP H.264 模式 (总延迟 ~30-50ms)                                    │
+│  TCP H.264 模式 (总延迟 ~30-50ms)                                        │
 │                                                                          │
-│  发送端:                                                                  │
-│  相机采集 → H.264 硬编码 → RTP 封装 → UDP 发送                            │
-│    16ms       1-3ms        <1ms       <1ms                               │
+│  发送端 (PC):                                                            │
+│  相机采集 → H.264 硬编码(NVENC) → TCP 发送                               │
+│    16ms         1-3ms              <5ms                                  │
 │                                                                          │
-│  接收端:                                                                  │
-│  UDP 接收 → RTP 解封装 → H.264 硬解码 → GPU 纹理                          │
-│    <1ms        <1ms         1-2ms       <1ms                             │
+│  接收端 (PICO):                                                          │
+│  TCP 接收 → H.264 硬解码(MediaCodec) → GPU 纹理                          │
+│    <5ms            1-2ms                <1ms                             │
+│                                                                          │
+│  握手协议:                                                               │
+│  PICO ──OPEN_CAMERA──→ PC                                               │
+│  PICO ←── TCP Connect ── PC (启动 FFmpeg 编码器)                         │
+│  PICO ──MEDIA_DECODER_READY──→ PC (开始发送视频流)                       │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 **低延迟原因:**
 1. **帧间压缩** - H.264 利用帧间冗余，P帧只存差异，编码快 5-10 倍
-2. **硬件加速** - GPU/专用芯片编解码，延迟极低
-3. **UDP 无重传** - 丢包不等待，牺牲可靠性换取低延迟
+2. **硬件加速** - NVENC 编码 + MediaCodec 解码，延迟极低
+3. **TCP 可靠传输** - 保证数据完整性，适合有线 USB 连接
 4. **零拷贝** - 解码直接输出到 GPU 纹理，无内存拷贝
 
 ### H.264 关键参数
@@ -134,15 +140,71 @@ python start_xrobo_compat.py
 
 ### 延迟测量对比
 
-| 环节 | WebSocket | UDP RTP H.264 |
+| 环节 | WebSocket | TCP H.264 |
 |------|-----------|---------------|
 | 相机采集 | 16ms | 16ms |
-| 编码 | 5-10ms | 1-3ms |
+| 编码 | 5-10ms | 1-3ms (NVENC) |
 | 传输封装 | 4-6ms | <1ms |
 | 网络传输 | 20-40ms | 5-15ms |
-| 接收解码 | 5-10ms | 1-2ms |
+| 接收解码 | 5-10ms | 1-2ms (MediaCodec) |
 | 渲染 | 16ms | 8ms |
 | **总计** | **66-98ms** | **32-45ms** |
+
+---
+
+## 通信协议详解
+
+### XRoboToolkit 视频流握手协议
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  三次握手确保正确的初始化顺序                                             │
+│                                                                          │
+│     PICO (Unity Client)              PC (Python Server)                  │
+│            │                                │                            │
+│            │──── OPEN_CAMERA ────────────→ │                            │
+│            │     (width, height, fps,      │                            │
+│            │      bitrate, ip, port)       │                            │
+│            │                                │                            │
+│            │                   启动 FFmpeg 编码器                         │
+│            │                   连接到 PICO:port                          │
+│            │                                │                            │
+│            │ ←───── TCP 连接建立 ──────────│                            │
+│            │                                │                            │
+│            │     MediaDecoder 初始化        │                            │
+│            │     (等待 0.5s 确保就绪)       │                            │
+│            │                                │                            │
+│            │──── MEDIA_DECODER_READY ────→ │                            │
+│            │     (port)                     │                            │
+│            │                                │                            │
+│            │ ←─────── 视频帧流 ────────────│                            │
+│            │     (连续 H.264 帧)            │                            │
+│            │                                │                            │
+│            │──── CLOSE_CAMERA ───────────→ │  (关闭时)                   │
+│            │                                │                            │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 协议命令格式
+
+```python
+# NetworkDataProtocol 结构
+{
+    "command": str,      # 命令名 (如 "OPEN_CAMERA")
+    "length": int,       # 数据长度
+    "data": bytes        # 二进制数据
+}
+
+# 序列化格式: | command (32 bytes, null-padded) | length (4 bytes, little-endian) | data |
+```
+
+### 命令列表
+
+| 命令 | 方向 | 数据 | 说明 |
+|------|------|------|------|
+| `OPEN_CAMERA` | PICO → PC | CameraRequest JSON | 请求打开相机流 |
+| `MEDIA_DECODER_READY` | PICO → PC | port (4 bytes int) | 通知解码器已就绪 |
+| `CLOSE_CAMERA` | PICO → PC | 空 | 关闭相机流 |
 
 ---
 
@@ -151,7 +213,7 @@ python start_xrobo_compat.py
 ```
 StereoVR/
 │
-├── 📦 sterovr/                    # 核心 Python 包
+├── 📦 teleopVision/                    # 核心 Python 包
 │   ├── __init__.py                # 库入口，导出公共 API
 │   ├── config.py                  # 配置管理 (dataclass)
 │   ├── camera.py                  # 相机采集模块
@@ -183,18 +245,18 @@ StereoVR/
 
 ```python
 # 遥操作场景 (低延迟)
-from sterovr import start_xrobo_server
+from teleopVision import start_xrobo_server
 start_xrobo_server(device_id=0)
 
 # WebXR 场景
-from sterovr import start_websocket_server
+from teleopVision import start_websocket_server
 start_websocket_server()
 ```
 
 ### 自定义配置
 
 ```python
-from sterovr import CameraConfig, EncoderConfig, StereoVRConfig
+from teleopVision import CameraConfig, EncoderConfig, StereoVRConfig
 
 config = StereoVRConfig(
     camera=CameraConfig(
@@ -212,7 +274,7 @@ config = StereoVRConfig(
 ### 直接使用相机模块
 
 ```python
-from sterovr import create_camera
+from teleopVision import create_camera
 
 camera = create_camera()
 camera.start()
@@ -245,11 +307,28 @@ while True:
 python start_xrobo_compat.py --width 1920 --height 540
 ```
 
-### 2. 使用 USB 有线
+### 2. 使用 USB 有线 (推荐)
+
+USB 有线连接延迟最低且最稳定。需要设置 ADB 端口转发:
 
 ```bash
-adb reverse tcp:63901 tcp:63901
-adb reverse tcp:12345 tcp:12345
+# 设置 ADB 端口转发 (在 PC 上运行)
+adb reverse tcp:63901 tcp:63901   # XRoboToolkit 控制通道
+adb forward tcp:12345 tcp:12345   # 视频流端口 (PC → PICO)
+
+# 验证端口转发
+adb reverse --list
+adb forward --list
+```
+
+**工作原理:**
+- `adb reverse`: 让 PICO 访问 `localhost:63901` 时转发到 PC 的 63901 端口
+- `adb forward`: 让 PC 访问 `localhost:12345` 时转发到 PICO 的 12345 端口
+
+**连接流程:**
+```
+PICO (localhost:63901) ←──reverse──→ PC (0.0.0.0:63901)  # 控制命令
+PC (localhost:12345)   ←──forward──→ PICO (12345)        # 视频流
 ```
 
 ### 3. 使用 5GHz WiFi
@@ -260,9 +339,20 @@ adb reverse tcp:12345 tcp:12345
 
 ## 常见问题
 
-### Q: 为什么用 UDP 而不是 TCP？
+### Q: 为什么用 TCP 而不是 UDP？
 
-TCP 丢包会重传，阻塞后续帧。实时视频场景下，**丢一帧比等一帧更好**。
+XRoboToolkit 模式使用 TCP 是因为:
+1. **USB ADB 转发** - ADB 端口转发对 TCP 支持更好，UDP 可能有问题
+2. **可靠性** - 有线 USB 连接下 TCP 重传开销极小
+3. **Android MediaCodec** - PICO 的解码器需要完整的 H.264 帧
+
+在纯 WiFi 场景下，UDP 可能延迟更低，但会有画面撕裂。
+
+### Q: 第一次连接失败 "Broken pipe" 怎么办？
+
+这通常是因为 MEDIA_DECODER_READY 信号未正确发送。检查:
+1. Unity 客户端是否正确等待 MediaDecoder 初始化 (0.5 秒)
+2. Python 服务器是否正确处理 MEDIA_DECODER_READY 命令
 
 ### Q: zerolatency 是什么？
 

@@ -209,7 +209,7 @@ def main():
     print()
 
     try:
-        from sterovr.xrobo_compat_server import XRoboCompatServer
+        from teleopVision.xrobo_compat_server import XRoboCompatServer
         server = XRoboCompatServer(device_id=args.device)
         server.start()
     except KeyboardInterrupt:

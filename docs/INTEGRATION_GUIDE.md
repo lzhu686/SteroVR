@@ -1,14 +1,14 @@
-# SteroVR → XRoboToolkit Unity Client 集成指南
+# TeleopVision → XRoboToolkit Unity Client 集成指南
 
 ## 概述
 
-本指南帮助你将 SteroVR 的 USB 双目相机视频流集成到 XRoboToolkit Unity Client 中，让 PICO 头显可以实时接收和显示 PC 端的双目相机画面。
+本指南帮助你将 TeleopVision 的 USB 双目相机视频流集成到 XRoboToolkit Unity Client 中，让 PICO 头显可以实时接收和显示 PC 端的双目相机画面。
 
 ## 架构说明
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  PC (运行 SteroVR)                                               │
+│  PC (运行 TeleopVision)                                               │
 │                                                                  │
 │  USB 双目相机 ──→ OpenCV 采集 ──→ FFmpeg H.264 编码 ──→ UDP 发送  │
 │                                                                  │
@@ -64,7 +64,7 @@
 ### 1.1 检查依赖
 
 ```bash
-cd SteroVR
+cd TeleopVision
 python start_xrobo_compat.py --check
 ```
 
@@ -146,10 +146,10 @@ python start_xrobo_compat.py --width 1920 --height 540 --fps 30
 检查 `Assets/StreamingAssets/video_source.yml` 是否包含 `USB_STEREO` 配置：
 
 ```yaml
-# USB Stereo Camera (SteroVR) - Added for integration
+# USB Stereo Camera (TeleopVision) - Added for integration
 - name: "USB_STEREO"
   camera: "USB"
-  description: "USB Stereo Camera via SteroVR"
+  description: "USB Stereo Camera via TeleopVision"
   properties:
     - name: "visibleRatio"
       type: "float"
@@ -320,7 +320,7 @@ config = VideoConfig(
 ## 文件结构
 
 ```
-SteroVR/
+TeleopVision/
 ├── server.py                  # 原始 WebSocket 服务器 (保留)
 ├── start.py                   # 原始启动脚本 (保留)
 ├── h264_sender.py             # [新增] H.264 视频编码发送器

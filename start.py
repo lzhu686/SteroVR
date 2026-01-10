@@ -96,7 +96,7 @@ def start_https_server():
 
 async def start_websocket_server():
     """启动 WSS WebSocket 服务器"""
-    from sterovr.server import USBStereoWebSocketServerSSL
+    from teleopVision.server import USBStereoWebSocketServerSSL
     server = USBStereoWebSocketServerSSL(host="0.0.0.0", port=WSS_PORT, use_ssl=True)
     try:
         await server.start_server()

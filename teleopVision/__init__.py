@@ -8,12 +8,12 @@ StereoVR - USB 双目立体视觉 VR 流媒体库
 快速开始:
 
     # WebSocket 模式 (WebXR)
-    from sterovr import WebSocketServer
+    from teleopVision import WebSocketServer
     server = WebSocketServer()
     server.start()
 
     # XRoboToolkit 兼容模式 (低延迟)
-    from sterovr import XRoboServer
+    from teleopVision import XRoboServer
     server = XRoboServer()
     server.start()
 
