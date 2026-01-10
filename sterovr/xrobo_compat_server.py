@@ -476,8 +476,10 @@ class XRoboCompatServer:
             logger.info("等待 PICO 头显连接...")
             logger.info("请在 Unity Client 中:")
             logger.info("  1. 选择视频源: ADB 或 WIFI")
-            logger.info("  2. 确认 IP 地址")
+            logger.info("  2. 确认 IP 地址 (ADB: 127.0.0.1, WIFI: 服务器IP)")
             logger.info("  3. 点击 Listen 按钮")
+            logger.info("")
+            logger.info("生命周期: 断开后自动清理，可重复连接")
             logger.info("=" * 60)
 
             # 接受连接
@@ -713,10 +715,25 @@ class XRoboCompatServer:
             self._set_state(StreamingState.IDLE)
 
     def _on_video_connection_lost(self, reason: str):
-        """视频连接断开回调"""
+        """
+        视频连接断开回调
+
+        这个回调在单独线程中执行 (由 h264_sender._handle_connection_lost 启动)
+        用于自动清理资源，准备接受新的连接
+        """
         logger.warning(f"视频连接断开: {reason}")
-        # 自动停止视频流
-        self._stop_video_stream_internal()
+        logger.info("正在清理资源，准备接受新连接...")
+
+        # 在新线程中清理，避免阻塞回调
+        def cleanup():
+            try:
+                self._stop_video_stream_internal()
+                logger.info("资源已清理，可以接受新的连接")
+            except Exception as e:
+                logger.error(f"清理资源失败: {e}")
+
+        cleanup_thread = threading.Thread(target=cleanup, daemon=True)
+        cleanup_thread.start()
 
     def _handle_stop_camera(self):
         """处理 StopReceivePcCamera 命令"""
@@ -732,7 +749,11 @@ class XRoboCompatServer:
             self._stop_video_stream_internal_unlocked()
 
     def _stop_video_stream_internal_unlocked(self):
-        """停止视频流 (假设已持有锁)"""
+        """
+        停止视频流 (假设已持有锁)
+
+        确保无论发生什么错误，都能正确清理资源
+        """
         if self._streaming_state == StreamingState.IDLE:
             logger.debug("视频流已经停止")
             return
@@ -742,19 +763,21 @@ class XRoboCompatServer:
             return
 
         self._streaming_state = StreamingState.STOPPING
+        logger.info("正在停止视频流...")
 
+        # 清理 video_sender
         if self.video_sender:
-            logger.info("正在停止视频流...")
             try:
                 self.video_sender.stop_streaming()
+                logger.info("视频发送器已停止")
             except Exception as e:
-                logger.warning(f"停止视频流异常: {e}")
+                logger.warning(f"停止视频发送器时出现异常: {e}")
             finally:
                 self.video_sender = None
 
         self._streaming_state = StreamingState.IDLE
         self._active_client_id = None
-        logger.info("视频流已停止")
+        logger.info("视频流已停止，等待新连接")
 
     def _handle_camera_list(self, client: socket.socket):
         """处理相机列表请求"""
