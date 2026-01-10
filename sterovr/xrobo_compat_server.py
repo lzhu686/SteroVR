@@ -384,6 +384,11 @@ class XRoboCompatServer:
         self._streaming_state = StreamingState.IDLE
         self._active_client_id: Optional[str] = None  # 当前活跃客户端标识
 
+        # 方案 A: 保存待处理的 OPEN_CAMERA 参数
+        # 收到 OPEN_CAMERA 时保存参数，等待 MEDIA_DECODER_READY 后才启动
+        self._pending_camera_params: Optional[dict] = None
+        self._pending_client: Optional[socket.socket] = None
+
         # 回调
         self.on_client_connected: Optional[Callable[[str], None]] = None
         self.on_streaming_started: Optional[Callable[[str, int], None]] = None
@@ -611,16 +616,65 @@ class XRoboCompatServer:
         elif func_name == 'OpenCamera':
             self._handle_open_camera(value, client)
 
+        elif func_name == 'MediaDecoderReady':
+            self._handle_media_decoder_ready(value, client)
+
         else:
             logger.warning(f"未知命令: {func_name}")
 
     def _handle_start_camera(self, params: dict, client: socket.socket):
-        """处理 StartReceivePcCamera 命令"""
+        """处理 StartReceivePcCamera 命令 (旧协议，立即启动)"""
         self._start_video_stream(params, client)
 
     def _handle_open_camera(self, params: dict, client: socket.socket):
-        """处理 OpenCamera 命令"""
-        self._start_video_stream(params, client)
+        """
+        处理 OpenCamera 命令 (方案 A)
+
+        行为: 保存参数，等待 MEDIA_DECODER_READY 后才启动视频流
+        这样可以确保 MediaDecoder 完全初始化后再开始发送数据
+        """
+        logger.info("收到 OPEN_CAMERA 命令，等待 MEDIA_DECODER_READY...")
+        logger.info(f"参数: {params.get('width', 2560)}x{params.get('height', 720)} @ "
+                    f"{params.get('fps', 60)}fps, {params.get('bitrate', 8000000)//1000000}Mbps")
+
+        # 保存参数，等待 MEDIA_DECODER_READY
+        with self._state_lock:
+            self._pending_camera_params = params
+            self._pending_client = client
+
+    def _handle_media_decoder_ready(self, value: dict, client: socket.socket):
+        """
+        处理 MEDIA_DECODER_READY 命令 (方案 A)
+
+        Unity 端在 MediaDecoder 完成初始化后发送此命令
+        收到后立即开始视频流推送
+        """
+        # 从 value 中获取端口 (可能是 dict 或 bytes)
+        port = 12345
+        if isinstance(value, dict):
+            port = value.get('port', 12345)
+        elif isinstance(value, bytes) and len(value) >= 4:
+            import struct
+            port = struct.unpack('<I', value[:4])[0]
+
+        logger.info(f"收到 MEDIA_DECODER_READY 信号, 端口: {port}")
+
+        # 检查是否有待处理的参数
+        with self._state_lock:
+            if self._pending_camera_params is None:
+                logger.warning("收到 MEDIA_DECODER_READY 但没有待处理的 OPEN_CAMERA 参数")
+                return
+
+            params = self._pending_camera_params
+            pending_client = self._pending_client
+
+            # 清除待处理状态
+            self._pending_camera_params = None
+            self._pending_client = None
+
+        # 启动视频流
+        logger.info("MediaDecoder 已就绪，开始启动视频流")
+        self._start_video_stream(params, pending_client or client)
 
     def _wait_for_media_decoder(self, target_ip: str, target_port: int,
                                  timeout: float = 5.0, interval: float = 0.1) -> bool:
@@ -701,19 +755,15 @@ class XRoboCompatServer:
         target_ip = params.get('clientIp', params.get('ip', ''))
         target_port = params.get('clientPort', params.get('port', 12345))
 
-        # ADB 模式处理 (需要先处理，因为探测需要正确的 IP)
+        # ADB 模式处理
         if self.adb_connected:
             logger.info(f"ADB 模式: 将目标 IP 从 {target_ip} 改为 127.0.0.1")
             target_ip = "127.0.0.1"
             self._setup_adb_forward(target_port)
 
-        # 方案 B: 主动探测 MediaDecoder 是否准备好
-        # 替代固定 3 秒等待，最快 ~0.1 秒，最慢 5 秒超时
-        if not self._wait_for_media_decoder(target_ip, target_port):
-            logger.error("MediaDecoder 未就绪，无法启动视频流")
-            self._send_error(client, "MediaDecoder not ready (timeout)")
-            self._set_state(StreamingState.IDLE)
-            return
+        # 方案 A: Unity 端已通过 MEDIA_DECODER_READY 通知就绪，无需探测
+        # 如果是旧协议 (StartReceivePcCamera)，仍使用方案 B 探测
+        # 这里假设调用者已确保 MediaDecoder 就绪
 
         logger.info(f"启动视频流: {target_ip}:{target_port}")
         logger.info(f"参数: {params.get('width', 2560)}x{params.get('height', 720)} @ "
