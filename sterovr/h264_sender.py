@@ -169,44 +169,55 @@ class SimpleH264Sender:
         """
         获取编码器参数 (低延迟优先)
 
-        参数说明:
-        - profile baseline: 无 CABAC，解码延迟最低
-        - preset p1: NVENC 最快预设，编码延迟最低
-        - bufsize bitrate/20: 小缓冲，减少编码延迟
-        - zerolatency: 禁用 B 帧和帧重排
+        参数分析 (2560x720):
+        ┌─────────────┬──────────────────────────────────────────────┐
+        │ Level 4.2   │ 足够支持 2560x720@60fps，无需 5.1            │
+        │ bufsize     │ 根据帧率自动调整:                            │
+        │             │   60fps → bitrate/60 ≈ 16ms (匹配帧间隔)     │
+        │             │   30fps → bitrate/30 ≈ 33ms (匹配帧间隔)     │
+        │ profile     │ baseline = 无CABAC，解码延迟最低             │
+        │ 码率        │ ADB: 20Mbps, WiFi: 12Mbps                    │
+        └─────────────┴──────────────────────────────────────────────┘
 
         设计原则: 遥操作场景延迟优先于画质
         """
+        # bufsize 根据帧率动态调整，约等于 1-2 帧的延迟
+        # 60fps: bufsize/60 ≈ 16ms (1帧)
+        # 30fps: bufsize/30 ≈ 33ms (1帧)
+        fps = self.config.fps if hasattr(self, 'config') else 30
+        bufsize_divisor = max(fps, 30)  # 至少 30，避免 bufsize 过大
+        bufsize_k = bitrate_k // bufsize_divisor
+
         if use_nvenc:
-            logger.info(f"使用 NVENC 硬件编码器 (低延迟), 码率: {bitrate_k} kbps")
+            logger.info(f"使用 NVENC 硬件编码器 (低延迟), 码率: {bitrate_k}k, bufsize: {bufsize_k}k ({1000//bufsize_divisor}ms)")
             return [
                 '-pix_fmt', 'yuv420p',
                 '-c:v', 'h264_nvenc',
                 '-preset', 'p1',               # 最快预设
                 '-tune', 'll',                 # low latency 调优
                 '-profile:v', 'baseline',      # 无 CABAC，解码快
-                '-level', '5.1',
+                '-level', '4.2',               # 足够 2560x720@60fps
                 '-rc', 'cbr',
                 '-b:v', f'{bitrate_k}k',
                 '-maxrate', f'{bitrate_k}k',
-                '-bufsize', f'{bitrate_k // 20}k',  # 小缓冲，低延迟
+                '-bufsize', f'{bufsize_k}k',   # 动态延迟
                 '-g', '1',
                 '-keyint_min', '1',
                 '-delay', '0',
                 '-zerolatency', '1',
             ]
         else:
-            logger.info(f"使用 libx264 软件编码器 (低延迟), 码率: {bitrate_k} kbps")
+            logger.info(f"使用 libx264 软件编码器 (低延迟), 码率: {bitrate_k}k, bufsize: {bufsize_k}k ({1000//bufsize_divisor}ms)")
             return [
                 '-pix_fmt', 'yuv420p',
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',        # 最快预设
                 '-tune', 'zerolatency',
                 '-profile:v', 'baseline',      # 无 CABAC，解码快
-                '-level', '5.1',
+                '-level', '4.2',               # 足够 2560x720@60fps
                 '-b:v', f'{bitrate_k}k',
                 '-maxrate', f'{bitrate_k}k',
-                '-bufsize', f'{bitrate_k // 20}k',
+                '-bufsize', f'{bufsize_k}k',   # 动态延迟
                 '-g', '1',
                 '-keyint_min', '1',
             ]
