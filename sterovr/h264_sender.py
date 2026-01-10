@@ -167,56 +167,57 @@ class SimpleH264Sender:
 
     def _get_encoder_args(self, bitrate_k: int, use_nvenc: bool) -> list:
         """
-        获取编码器参数 (画质优化版)
+        获取编码器参数 (低延迟优先)
+
+        遥操作核心原则:
+        - 延迟优先于画质
+        - 画质通过提高码率保证，而不是编码器参数
+        - preset p1 + baseline = 最低编码延迟 (~5ms)
 
         参数说明:
-        - pix_fmt yuv420p: 最通用的像素格式
-        - profile high: 启用 CABAC + 8x8 变换，画质提升 15-20%
-        - bufsize: 增大到 bitrate/4，给编码器更多码率缓冲
-        - AQ (自适应量化): 提升细节保留，减少闪烁
+        - preset p1: NVENC 最快预设，编码延迟最低
+        - profile baseline: 无 CABAC，解码延迟最低
+        - tune ll + zerolatency: 禁用帧缓冲和重排
+        - bufsize bitrate/20: 小缓冲，减少编码器内部延迟
 
-        画质 vs 延迟权衡:
-        - preset p4 比 p1 画质好 10-15%，延迟增加约 3ms
-        - high profile 比 baseline 画质好 15-20%，解码延迟增加约 2ms
-        - 总延迟增加约 10ms (50ms → 60ms)，对遥操作仍可接受
+        为什么不用 p4/high/spatial-aq？
+        - p4 vs p1: +10-30ms 编码延迟
+        - high vs baseline: +5-15ms 解码延迟 (CABAC)
+        - spatial-aq: +5-10ms 分析延迟
+        - 对遥操作是致命的，宁可画质差也要延迟低
         """
         if use_nvenc:
-            logger.info(f"使用 NVENC 硬件编码器 (画质优化), 码率: {bitrate_k} kbps")
+            logger.info(f"使用 NVENC 硬件编码器 (低延迟), 码率: {bitrate_k} kbps")
             return [
                 '-pix_fmt', 'yuv420p',
                 '-c:v', 'h264_nvenc',
-                '-preset', 'p4',               # 平衡质量和速度 (p1最快p7最好)
+                '-preset', 'p1',               # 最快预设，最低延迟
                 '-tune', 'll',                 # low latency 调优
-                '-profile:v', 'high',          # 画质优先 (启用 CABAC)
-                '-level', '5.1',
+                '-profile:v', 'baseline',      # 无 CABAC，解码最快
+                '-level', '4.2',               # 足够 2560x720@60fps
                 '-rc', 'cbr',
                 '-b:v', f'{bitrate_k}k',
                 '-maxrate', f'{bitrate_k}k',
-                '-bufsize', f'{bitrate_k // 4}k',  # 5Mbit 缓冲，画质更稳定
-                '-g', '1',
+                '-bufsize', f'{bitrate_k // 20}k',  # 小缓冲，低延迟
+                '-g', '1',                     # GOP=1，每帧独立
                 '-keyint_min', '1',
                 '-delay', '0',
                 '-zerolatency', '1',
-                # 画质增强
-                '-spatial-aq', '1',            # 空间自适应量化
-                '-temporal-aq', '1',           # 时间自适应量化
-                '-aq-strength', '8',           # AQ 强度 (1-15)
             ]
         else:
-            logger.info(f"使用 libx264 软件编码器 (画质优化), 码率: {bitrate_k} kbps")
+            logger.info(f"使用 libx264 软件编码器 (低延迟), 码率: {bitrate_k} kbps")
             return [
                 '-pix_fmt', 'yuv420p',
                 '-c:v', 'libx264',
-                '-preset', 'faster',           # 画质更好 (比 veryfast)
-                '-tune', 'zerolatency',
-                '-profile:v', 'high',          # 画质优先
-                '-level', '5.1',
+                '-preset', 'ultrafast',        # 最快预设
+                '-tune', 'zerolatency',        # 零延迟调优
+                '-profile:v', 'baseline',      # 无 CABAC
+                '-level', '4.2',
                 '-b:v', f'{bitrate_k}k',
                 '-maxrate', f'{bitrate_k}k',
-                '-bufsize', f'{bitrate_k // 4}k',
+                '-bufsize', f'{bitrate_k // 20}k',
                 '-g', '1',
                 '-keyint_min', '1',
-                '-x264-params', 'repeat-headers=1:aq-mode=2:aq-strength=1.0',
             ]
 
     # ============== 相机初始化 ==============
