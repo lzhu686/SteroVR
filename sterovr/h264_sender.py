@@ -186,48 +186,50 @@ class SimpleH264Sender:
 
     def _get_encoder_args(self, bitrate_k: int, use_nvenc: bool) -> list:
         """
-        获取编码器参数 (低延迟优先)
+        获取编码器参数 (画质优化)
 
         参数说明:
-        - profile baseline: 无 CABAC，解码延迟最低
-        - preset p1: NVENC 最快预设，编码延迟最低
-        - bufsize bitrate/20: 小缓冲，减少编码延迟
-        - zerolatency: 禁用 B 帧和帧重排
+        - profile high: CABAC 压缩效率提升 15-20%
+        - preset p4: NVENC 平衡预设，画质与速度兼顾
+        - spatial-aq: 自适应量化，减少块效应
+        - temporal-aq: 时间域自适应，减少闪烁
+        - bufsize bitrate/20: 保持小缓冲
 
-        设计原则: 遥操作场景延迟优先于画质
+        设计原则: WiFi 场景画质优先，接受偶尔卡顿
         """
         if use_nvenc:
-            logger.info(f"使用 NVENC 硬件编码器 (低延迟), 码率: {bitrate_k} kbps")
+            logger.info(f"使用 NVENC 硬件编码器 (画质优化), 码率: {bitrate_k} kbps")
             return [
                 '-pix_fmt', 'yuv420p',
                 '-c:v', 'h264_nvenc',
-                '-preset', 'p1',               # 最快预设
-                '-tune', 'll',                 # low latency 调优
-                '-profile:v', 'baseline',      # 无 CABAC，解码快
-                '-level', '5.1',
+                '-preset', 'p4',               # 平衡预设 (之前 p1)
+                '-profile:v', 'high',          # 高压缩效率 (之前 baseline)
+                '-level', '4.2',               # 足够 2560x720@60fps
                 '-rc', 'cbr',
                 '-b:v', f'{bitrate_k}k',
                 '-maxrate', f'{bitrate_k}k',
-                '-bufsize', f'{bitrate_k // 20}k',  # 小缓冲，低延迟
-                '-g', '1',
+                '-bufsize', f'{bitrate_k // 20}k',
+                '-g', '1',                     # GOP=1 保持
                 '-keyint_min', '1',
-                '-delay', '0',
-                '-zerolatency', '1',
+                '-spatial-aq', '1',            # 自适应量化，减少块效应
+                '-temporal-aq', '1',           # 时间域自适应，减少闪烁
+                '-aq-strength', '8',           # AQ 强度
             ]
         else:
-            logger.info(f"使用 libx264 软件编码器 (低延迟), 码率: {bitrate_k} kbps")
+            logger.info(f"使用 libx264 软件编码器 (画质优化), 码率: {bitrate_k} kbps")
             return [
                 '-pix_fmt', 'yuv420p',
                 '-c:v', 'libx264',
-                '-preset', 'ultrafast',        # 最快预设
-                '-tune', 'zerolatency',
-                '-profile:v', 'baseline',      # 无 CABAC，解码快
-                '-level', '5.1',
+                '-preset', 'fast',             # 平衡预设 (之前 ultrafast)
+                '-profile:v', 'high',          # 高压缩效率 (之前 baseline)
+                '-level', '4.2',
                 '-b:v', f'{bitrate_k}k',
                 '-maxrate', f'{bitrate_k}k',
                 '-bufsize', f'{bitrate_k // 20}k',
                 '-g', '1',
                 '-keyint_min', '1',
+                '-aq-mode', '2',               # 方差自适应量化
+                '-aq-strength', '1.0',
             ]
 
     # ============== 相机初始化 ==============
