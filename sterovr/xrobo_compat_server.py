@@ -203,6 +203,13 @@ class PacketParser:
                     "functionName": "StopReceivePcCamera"
                 }
 
+            elif command == "MEDIA_DECODER_READY":
+                # 返回原始 payload (bytes)，让 _handle_media_decoder_ready 解析端口
+                return ProtocolConstants.CMD_FUNCTION, {
+                    "functionName": "MediaDecoderReady",
+                    "value": payload
+                }
+
             return None, None
 
         except Exception as e:
