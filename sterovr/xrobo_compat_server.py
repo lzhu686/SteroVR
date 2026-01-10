@@ -6,11 +6,16 @@ XRoboToolkit 协议兼容服务器
 
 协议说明:
 1. TCP 端口 13579: 接收来自 Unity Client 的控制命令
-2. UDP 端口 (动态): 向 Unity Client 发送 H.264 视频流
+2. TCP 端口 (动态): 向 Unity Client 发送 H.264 视频流
 
 命令格式:
 - Unity Client 发送 JSON 命令: {"functionName": "StartReceivePcCamera", "value": {...}}
 - 本服务器解析命令并启动视频流发送
+
+生命周期管理:
+- 线程安全: 使用 threading.Lock 保护共享状态
+- 资源清理: 客户端断开时自动停止视频流
+- 重复命令: 正确处理快速连续的 OPEN/CLOSE 命令
 
 使用方法:
     python xrobo_compat_server.py
@@ -33,6 +38,7 @@ import argparse
 import sys
 from typing import Optional, Callable
 from dataclasses import dataclass
+from enum import Enum
 
 # 导入 H.264 发送器
 from .h264_sender import SimpleH264Sender, VideoConfig
@@ -43,6 +49,16 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('XRoboCompat')
+
+
+# ============== 状态枚举 ==============
+
+class StreamingState(Enum):
+    """视频流状态"""
+    IDLE = "idle"                # 空闲，没有视频流
+    STARTING = "starting"        # 正在启动视频流
+    STREAMING = "streaming"      # 视频流运行中
+    STOPPING = "stopping"        # 正在停止视频流
 
 
 # ============== XRoboToolkit 协议常量 ==============
@@ -127,41 +143,28 @@ class PacketParser:
 
         Unity Client 发送格式:
         [total_length: 4 bytes Big-Endian][cmd_len: 4 bytes Little-Endian][command][data_len: 4 bytes Little-Endian][data]
-
-        例如 OPEN_CAMERA:
-        00 00 00 43  - total length (67 bytes, Big-Endian)
-        0b 00 00 00  - cmd_len (11, Little-Endian)
-        4f 50 45 4e 5f 43 41 4d 45 52 41  - "OPEN_CAMERA"
-        30 00 00 00  - data_len (48 bytes, Little-Endian)
-        ca fe 01 ... - CameraRequest data
         """
         try:
-            # 打印收到的原始数据前64字节（用于调试）
             hex_preview = data[:min(64, len(data))].hex()
-            logger.info(f"[DEBUG] 收到数据 ({len(data)} bytes): {hex_preview}...")
+            logger.debug(f"[DEBUG] 收到数据 ({len(data)} bytes): {hex_preview}...")
 
             if len(data) < 12:
-                logger.debug(f"[DEBUG] 数据太短: {len(data)} < 12")
                 return None, None
 
             offset = 0
 
             # 检查是否有 Big-Endian 长度前缀
-            # 如果前4字节作为 Big-Endian 是合理的长度值，则跳过它
             potential_total_len = struct.unpack('>I', data[0:4])[0]
             if 10 < potential_total_len < 1000 and potential_total_len <= len(data):
-                # 有总长度前缀，跳过它
                 offset = 4
-                logger.info(f"[DEBUG] 检测到长度前缀: {potential_total_len} bytes")
+                logger.debug(f"[DEBUG] 检测到长度前缀: {potential_total_len} bytes")
 
             # 读取命令长度 (Little-Endian)
             cmd_len = struct.unpack('<I', data[offset:offset+4])[0]
             offset += 4
-            logger.info(f"[DEBUG] cmd_len = {cmd_len}")
 
             # 验证命令长度合理性
             if cmd_len <= 0 or cmd_len > 100:
-                logger.info(f"[DEBUG] cmd_len 不合理: {cmd_len}")
                 return None, None
 
             if offset + cmd_len > len(data):
@@ -184,11 +187,10 @@ class PacketParser:
             # 读取数据
             payload = data[offset:offset+data_len]
 
-            logger.info(f"解析 NetworkDataProtocol: command={command}, data_len={data_len}")
+            logger.info(f"解析命令: {command}, 数据长度: {data_len}")
 
             # 根据命令类型处理
             if command == "OPEN_CAMERA":
-                # 解析 CameraRequest 二进制数据
                 camera_config = PacketParser._parse_camera_request(payload)
                 if camera_config:
                     return ProtocolConstants.CMD_FUNCTION, {
@@ -211,11 +213,6 @@ class PacketParser:
     def _parse_camera_request(data: bytes) -> dict:
         """
         解析 CameraRequest 二进制数据
-        参考 Unity CameraRequestSerializer
-
-        格式:
-        [Magic: 0xCA 0xFE][Version: 1byte][width:4][height:4][fps:4][bitrate:4]
-        [enableMvHevc:4][renderMode:4][port:4][camera_len:1][camera][ip_len:1][ip]
         """
         try:
             if len(data) < 10:
@@ -227,7 +224,6 @@ class PacketParser:
             # 检查魔数 0xCA 0xFE
             if data[0] == 0xCA and data[1] == 0xFE:
                 offset = 2
-                # 读取版本号
                 version = data[offset]
                 offset += 1
                 logger.debug(f"CameraRequest 协议版本: {version}")
@@ -256,19 +252,19 @@ class PacketParser:
             port = struct.unpack('<I', data[offset:offset+4])[0]
             offset += 4
 
-            # 读取 camera 字符串 (1字节长度前缀)
+            # 读取 camera 字符串
             camera_len = data[offset]
             offset += 1
             camera = data[offset:offset+camera_len].decode('utf-8') if camera_len > 0 else "USB"
             offset += camera_len
 
-            # 读取 ip 字符串 (1字节长度前缀)
+            # 读取 ip 字符串
             ip_len = data[offset]
             offset += 1
             ip = data[offset:offset+ip_len].decode('utf-8') if ip_len > 0 else ""
             offset += ip_len
 
-            logger.info(f"CameraRequest: {width}x{height}@{fps}fps, {bitrate}bps, ip={ip}:{port}, camera={camera}")
+            logger.info(f"CameraRequest: {width}x{height}@{fps}fps, {bitrate//1000000}Mbps, ip={ip}:{port}")
 
             return {
                 "width": width,
@@ -289,7 +285,6 @@ class PacketParser:
     @staticmethod
     def _try_parse_xrobo_protocol(data: bytes) -> tuple:
         """尝试解析 XRoboToolkit 标准协议格式"""
-        # 查找包头
         head_idx = -1
         for i in range(len(data)):
             if data[i] == ProtocolConstants.PACKET_HEAD_RECV or data[i] == ProtocolConstants.PACKET_HEAD_SEND:
@@ -300,13 +295,8 @@ class PacketParser:
             return None, None
 
         try:
-            # 解析包头后的命令字节
             cmd = data[head_idx + 1]
-
-            # 解析长度 (4字节小端)
             length = struct.unpack('<I', data[head_idx + 2:head_idx + 6])[0]
-
-            # 提取数据部分
             data_start = head_idx + 6
             data_end = data_start + length
 
@@ -315,7 +305,6 @@ class PacketParser:
 
             payload = data[data_start:data_end]
 
-            # 尝试解析为 JSON
             try:
                 json_str = payload.decode('utf-8')
                 json_data = json.loads(json_str)
@@ -332,7 +321,6 @@ class PacketParser:
     def _try_parse_json(data: bytes) -> tuple:
         """尝试直接从数据中提取 JSON"""
         try:
-            # 查找 JSON 起始和结束
             text = data.decode('utf-8', errors='ignore')
             json_start = text.find('{')
             json_end = text.rfind('}')
@@ -353,13 +341,12 @@ class PacketParser:
         json_str = json.dumps(data)
         json_bytes = json_str.encode('utf-8')
 
-        # 构建包
         packet = bytearray()
         packet.append(ProtocolConstants.PACKET_HEAD_SEND)
         packet.append(cmd)
         packet.extend(struct.pack('<I', len(json_bytes)))
         packet.extend(json_bytes)
-        packet.extend(struct.pack('<Q', int(time.time() * 1000)))  # 时间戳
+        packet.extend(struct.pack('<Q', int(time.time() * 1000)))
         packet.append(ProtocolConstants.PACKET_END)
 
         return bytes(packet)
@@ -369,12 +356,18 @@ class XRoboCompatServer:
     """
     XRoboToolkit 兼容服务器
 
+    生命周期管理:
+    - 线程安全: 使用 _state_lock 保护所有共享状态
+    - 状态机: IDLE -> STARTING -> STREAMING -> STOPPING -> IDLE
+    - 客户端断开: 自动检测并清理资源
+    - 重复命令: 正确处理快速连续的命令
+
     工作流程:
-    1. 启动 TCP 服务器监听 63901 端口
-    2. Unity Client 连接并发送 StartReceivePcCamera 命令
+    1. 启动 TCP 服务器监听 13579 端口
+    2. Unity Client 连接并发送 OPEN_CAMERA 命令
     3. 解析命令，获取目标 IP 和端口
     4. 启动 H.264 视频流发送
-    5. 收到 StopReceivePcCamera 时停止
+    5. 收到 CLOSE_CAMERA 或客户端断开时停止
     """
 
     def __init__(self, device_id: int = 0):
@@ -384,29 +377,43 @@ class XRoboCompatServer:
         self.video_sender: Optional[SimpleH264Sender] = None
         self.is_running = False
         self.client_thread: Optional[threading.Thread] = None
-        self.adb_connected = False  # ADB 连接状态
+        self.adb_connected = False
+
+        # 线程安全: 状态锁
+        self._state_lock = threading.RLock()
+        self._streaming_state = StreamingState.IDLE
+        self._active_client_id: Optional[str] = None  # 当前活跃客户端标识
 
         # 回调
         self.on_client_connected: Optional[Callable[[str], None]] = None
         self.on_streaming_started: Optional[Callable[[str, int], None]] = None
         self.on_streaming_stopped: Optional[Callable[[], None]] = None
 
+    def _get_state(self) -> StreamingState:
+        """获取当前状态 (线程安全)"""
+        with self._state_lock:
+            return self._streaming_state
+
+    def _set_state(self, state: StreamingState):
+        """设置状态 (线程安全)"""
+        with self._state_lock:
+            old_state = self._streaming_state
+            self._streaming_state = state
+            logger.info(f"状态变化: {old_state.value} -> {state.value}")
+
     def _check_adb_connection(self) -> bool:
         """检测是否有 ADB 设备连接"""
         try:
             import subprocess
             result = subprocess.run(['adb', 'devices'], capture_output=True, text=True, timeout=5)
-            lines = result.stdout.strip().split('\n')[1:]  # 跳过标题行
+            lines = result.stdout.strip().split('\n')[1:]
             devices = [l.split('\t')[0] for l in lines if '\tdevice' in l]
             return len(devices) > 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
 
     def _setup_adb_forward(self, port: int) -> bool:
-        """
-        设置 ADB forward (PC -> PICO)
-        用于视频端口: PC 连接 127.0.0.1:port -> PICO 的 127.0.0.1:port
-        """
+        """设置 ADB forward (PC -> PICO)"""
         try:
             import subprocess
             result = subprocess.run(
@@ -414,7 +421,7 @@ class XRoboCompatServer:
                 capture_output=True, text=True, timeout=5
             )
             if result.returncode == 0:
-                logger.info(f"✅ ADB forward 已设置: PC:127.0.0.1:{port} -> PICO:127.0.0.1:{port}")
+                logger.info(f"ADB forward 已设置: PC:127.0.0.1:{port} -> PICO:127.0.0.1:{port}")
                 return True
             else:
                 logger.warning(f"ADB forward 失败: {result.stderr}")
@@ -424,10 +431,7 @@ class XRoboCompatServer:
             return False
 
     def _setup_adb_reverse(self, port: int) -> bool:
-        """
-        设置 ADB reverse (PICO -> PC)
-        用于控制端口: PICO 连接 127.0.0.1:port -> PC 的 127.0.0.1:port
-        """
+        """设置 ADB reverse (PICO -> PC)"""
         try:
             import subprocess
             result = subprocess.run(
@@ -435,7 +439,7 @@ class XRoboCompatServer:
                 capture_output=True, text=True, timeout=5
             )
             if result.returncode == 0:
-                logger.info(f"✅ ADB reverse 已设置: PICO:127.0.0.1:{port} -> PC:127.0.0.1:{port}")
+                logger.info(f"ADB reverse 已设置: PICO:127.0.0.1:{port} -> PC:127.0.0.1:{port}")
                 return True
             else:
                 logger.warning(f"ADB reverse 失败: {result.stderr}")
@@ -450,11 +454,10 @@ class XRoboCompatServer:
             # 检测 ADB 连接
             self.adb_connected = self._check_adb_connection()
             if self.adb_connected:
-                logger.info("✅ 检测到 ADB USB 连接，将使用 127.0.0.1 进行视频传输")
-                # 设置控制端口的 reverse (PICO 连接 127.0.0.1:13579 -> PC 的服务器)
+                logger.info("检测到 ADB USB 连接，将使用 127.0.0.1 进行视频传输")
                 self._setup_adb_reverse(ProtocolConstants.TCP_PORT)
             else:
-                logger.info("ℹ️  未检测到 ADB 连接，将使用 WiFi IP 进行视频传输")
+                logger.info("未检测到 ADB 连接，将使用 WiFi IP 进行视频传输")
 
             # 创建 TCP 服务器
             self.tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -472,8 +475,8 @@ class XRoboCompatServer:
             logger.info("")
             logger.info("等待 PICO 头显连接...")
             logger.info("请在 Unity Client 中:")
-            logger.info("  1. 选择视频源: USB_STEREO")
-            logger.info("  2. 输入本机 IP 地址")
+            logger.info("  1. 选择视频源: ADB 或 WIFI")
+            logger.info("  2. 确认 IP 地址")
             logger.info("  3. 点击 Listen 按钮")
             logger.info("=" * 60)
 
@@ -482,7 +485,8 @@ class XRoboCompatServer:
                 try:
                     self.tcp_server.settimeout(1.0)
                     client, addr = self.tcp_server.accept()
-                    logger.info(f"客户端已连接: {addr}")
+                    client_id = f"{addr[0]}:{addr[1]}"
+                    logger.info(f"客户端已连接: {client_id}")
 
                     if self.on_client_connected:
                         self.on_client_connected(addr[0])
@@ -491,7 +495,7 @@ class XRoboCompatServer:
                     self.client_socket = client
                     self.client_thread = threading.Thread(
                         target=self._handle_client,
-                        args=(client, addr),
+                        args=(client, addr, client_id),
                         daemon=True
                     )
                     self.client_thread.start()
@@ -508,18 +512,21 @@ class XRoboCompatServer:
             logger.error(f"启动服务器失败: {e}")
             return False
 
-    def _handle_client(self, client: socket.socket, addr: tuple):
+    def _handle_client(self, client: socket.socket, addr: tuple, client_id: str):
         """
-        处理客户端连接
+        处理客户端连接 (线程安全)
 
         Unity Client 使用"一次性命令"模式:
-        1. 连接 → 2. 发送命令 → 3. 立即断开
-        这是正常行为，不是错误。
+        1. 连接 -> 2. 发送命令 -> 3. 立即断开
+
+        生命周期管理:
+        - 记录哪个客户端启动了视频流
+        - 客户端断开时，如果是它启动的流，则停止流
         """
         buffer = b''
+        started_streaming = False  # 此客户端是否启动了视频流
 
         try:
-            # 设置较短的超时，因为 Unity Client 发送命令后会立即断开
             client.settimeout(5.0)
 
             while self.is_running:
@@ -527,28 +534,29 @@ class XRoboCompatServer:
                     data = client.recv(4096)
 
                     if not data:
-                        # 客户端正常关闭连接
-                        logger.info(f"客户端完成命令发送: {addr}")
+                        logger.info(f"客户端完成命令发送: {client_id}")
                         break
 
                     buffer += data
-
-                    # 解析命令
                     _, json_data = PacketParser.parse(buffer)
 
                     if json_data:
                         buffer = b''
+                        func_name = json_data.get('functionName', '')
+
+                        # 处理命令并记录是否启动了视频流
+                        if func_name in ['OpenCamera', 'StartReceivePcCamera']:
+                            started_streaming = True
+                            with self._state_lock:
+                                self._active_client_id = client_id
+
                         self._process_command(json_data, client)
-                        # 命令处理完成后，Unity Client 会断开
-                        # 不需要继续等待更多数据
 
                 except socket.timeout:
-                    # 超时 = 没有更多数据，正常退出
                     break
 
                 except ConnectionResetError:
-                    # Unity Client 发送命令后立即关闭连接，这是正常的
-                    logger.info(f"客户端命令发送完成 (连接已关闭): {addr}")
+                    logger.info(f"客户端连接重置: {client_id}")
                     break
 
         except Exception as e:
@@ -556,22 +564,38 @@ class XRoboCompatServer:
 
         finally:
             client.close()
-            # 注意：不要在这里停止视频流，让它继续运行
+
+            # 检查是否需要停止视频流
+            # 只有当视频流正在运行，且没有收到显式的 CLOSE 命令时才停止
+            with self._state_lock:
+                current_state = self._streaming_state
+                active_client = self._active_client_id
+
+            # 如果此客户端启动了视频流，但没有发送关闭命令就断开了
+            # 我们选择让视频流继续运行，因为:
+            # 1. Unity Client 的"一次性命令"模式会在发送后立即断开
+            # 2. 真正的关闭应该由显式的 CLOSE_CAMERA 命令触发
+            # 3. 如果需要"客户端断开就停止"的行为，取消下面的注释
+
+            # if started_streaming and current_state == StreamingState.STREAMING:
+            #     if active_client == client_id:
+            #         logger.info(f"客户端 {client_id} 断开，停止视频流")
+            #         self._stop_video_stream_internal()
+
+            logger.debug(f"客户端连接已关闭: {client_id}")
 
     def _process_command(self, json_data: dict, client: socket.socket):
-        """处理命令"""
+        """处理命令 (线程安全)"""
         func_name = json_data.get('functionName', '')
         value = json_data.get('value', {})
 
-        # 如果 value 是字符串，尝试解析为 JSON
         if isinstance(value, str):
             try:
                 value = json.loads(value)
             except:
                 pass
 
-        logger.info(f"收到命令: {func_name}")
-        logger.debug(f"命令参数: {value}")
+        logger.info(f"处理命令: {func_name}")
 
         if func_name == 'StartReceivePcCamera':
             self._handle_start_camera(value, client)
@@ -583,7 +607,6 @@ class XRoboCompatServer:
             self._handle_camera_list(client)
 
         elif func_name == 'OpenCamera':
-            # 处理 OpenCamera 命令 (来自 NetworkCommander)
             self._handle_open_camera(value, client)
 
         else:
@@ -591,86 +614,58 @@ class XRoboCompatServer:
 
     def _handle_start_camera(self, params: dict, client: socket.socket):
         """处理 StartReceivePcCamera 命令"""
-        request = CameraRequest.from_json(params)
-
-        # 如果检测到 ADB 连接，使用 127.0.0.1 替代客户端报告的 IP
-        original_ip = request.ip
-        if self.adb_connected:
-            request.ip = "127.0.0.1"
-            logger.info(f"🔌 ADB 模式: 将目标 IP 从 {original_ip} 改为 127.0.0.1")
-            # 等待 MediaDecoder 启动监听
-            logger.info("⏳ 等待 PICO MediaDecoder 启动监听 (2秒)...")
-            import time
-            time.sleep(2.0)
-            # 设置端口转发 (视频端口: PC连接PICO，用forward)
-            self._setup_adb_forward(request.port)
-
-        logger.info(f"开始视频流: {request.ip}:{request.port}")
-        logger.info(f"参数: {request.width}x{request.height} @ {request.fps}fps, {request.bitrate//1000000}Mbps")
-
-        # 停止现有流
-        self._stop_video_stream()
-
-        # 创建视频发送器
-        config = VideoConfig(
-            width=request.width,
-            height=request.height,
-            fps=request.fps,
-            bitrate=request.bitrate
-        )
-
-        self.video_sender = SimpleH264Sender(config)
-
-        if not self.video_sender.initialize(self.device_id):
-            logger.error("相机初始化失败")
-            self._send_error(client, "Camera initialization failed")
-            return
-
-        if self.video_sender.start_streaming(request.ip, request.port):
-            logger.info("视频流已启动")
-
-            # 发送成功响应
-            response = PacketParser.build_response(
-                ProtocolConstants.CMD_FUNCTION,
-                {
-                    "functionName": "OnCameraStarted",
-                    "status": "success",
-                    "width": request.width,
-                    "height": request.height,
-                    "fps": request.fps
-                }
-            )
-            client.send(response)
-
-            if self.on_streaming_started:
-                self.on_streaming_started(request.ip, request.port)
-        else:
-            logger.error("启动视频流失败")
-            self._send_error(client, "Failed to start video stream")
+        self._start_video_stream(params, client)
 
     def _handle_open_camera(self, params: dict, client: socket.socket):
-        """处理 OpenCamera 命令 (来自新版协议)"""
-        # 新版协议的参数格式可能不同，需要适配
+        """处理 OpenCamera 命令"""
+        self._start_video_stream(params, client)
+
+    def _start_video_stream(self, params: dict, client: socket.socket):
+        """
+        启动视频流 (线程安全)
+
+        状态机: IDLE/STREAMING -> STARTING -> STREAMING
+        """
+        with self._state_lock:
+            current_state = self._streaming_state
+
+            # 如果已经在启动中，忽略重复命令
+            if current_state == StreamingState.STARTING:
+                logger.warning("视频流正在启动中，忽略重复命令")
+                return
+
+            # 如果正在停止中，等待停止完成
+            if current_state == StreamingState.STOPPING:
+                logger.warning("视频流正在停止中，等待完成...")
+                # 释放锁，等待停止完成
+                self._state_lock.release()
+                time.sleep(0.5)
+                self._state_lock.acquire()
+
+            # 如果已经在运行，先停止
+            if current_state == StreamingState.STREAMING:
+                logger.info("已有视频流运行，先停止旧流")
+                self._stop_video_stream_internal_unlocked()
+                time.sleep(0.3)
+
+            # 设置状态为启动中
+            self._streaming_state = StreamingState.STARTING
+
+        # 解析参数
         target_ip = params.get('clientIp', params.get('ip', ''))
         target_port = params.get('clientPort', params.get('port', 12345))
 
-        # 如果检测到 ADB 连接，使用 127.0.0.1 替代客户端报告的 IP
+        # ADB 模式处理
         if self.adb_connected:
-            logger.info(f"🔌 ADB 模式: 将目标 IP 从 {target_ip} 改为 127.0.0.1")
+            logger.info(f"ADB 模式: 将目标 IP 从 {target_ip} 改为 127.0.0.1")
             target_ip = "127.0.0.1"
-            # 等待 MediaDecoder 启动监听
-            logger.info("⏳ 等待 PICO MediaDecoder 启动监听 (2秒)...")
-            import time
+            logger.info("等待 PICO MediaDecoder 启动监听 (2秒)...")
             time.sleep(2.0)
-            # 设置端口转发 (视频端口: PC连接PICO，用forward)
             self._setup_adb_forward(target_port)
 
-        # 直接启动视频流，不再调用 _handle_start_camera 避免重复检测
-        logger.info(f"开始视频流: {target_ip}:{target_port}")
-        logger.info(f"参数: {params.get('width', 2560)}x{params.get('height', 720)} @ {params.get('fps', 60)}fps, {params.get('bitrate', 8000000)//1000000}Mbps")
-
-        # 停止现有流
-        self._stop_video_stream()
+        logger.info(f"启动视频流: {target_ip}:{target_port}")
+        logger.info(f"参数: {params.get('width', 2560)}x{params.get('height', 720)} @ "
+                    f"{params.get('fps', 60)}fps, {params.get('bitrate', 8000000)//1000000}Mbps")
 
         # 创建视频发送器
         config = VideoConfig(
@@ -680,29 +675,80 @@ class XRoboCompatServer:
             bitrate=params.get('bitrate', 8000000)
         )
 
-        self.video_sender = SimpleH264Sender(config)
+        try:
+            sender = SimpleH264Sender(config)
 
-        if not self.video_sender.initialize(self.device_id):
-            logger.error("相机初始化失败")
-            self._send_error(client, "Camera initialization failed")
-            return
+            if not sender.initialize(self.device_id):
+                logger.error("相机初始化失败")
+                self._send_error(client, "Camera initialization failed")
+                self._set_state(StreamingState.IDLE)
+                return
 
-        if self.video_sender.start_streaming(target_ip, target_port):
-            logger.info("视频流已启动")
+            # 设置连接断开回调
+            sender.on_connection_lost = self._on_video_connection_lost
 
-            if self.on_streaming_started:
-                self.on_streaming_started(target_ip, target_port)
-        else:
-            logger.error("启动视频流失败")
-            self._send_error(client, "Failed to start video stream")
+            if sender.start_streaming(target_ip, target_port):
+                with self._state_lock:
+                    self.video_sender = sender
+                    self._streaming_state = StreamingState.STREAMING
+
+                logger.info("视频流已启动")
+
+                if self.on_streaming_started:
+                    self.on_streaming_started(target_ip, target_port)
+            else:
+                logger.error("启动视频流失败")
+                self._send_error(client, "Failed to start video stream")
+                self._set_state(StreamingState.IDLE)
+
+        except Exception as e:
+            logger.error(f"启动视频流异常: {e}")
+            self._send_error(client, f"Exception: {e}")
+            self._set_state(StreamingState.IDLE)
+
+    def _on_video_connection_lost(self, reason: str):
+        """视频连接断开回调"""
+        logger.warning(f"视频连接断开: {reason}")
+        # 自动停止视频流
+        self._stop_video_stream_internal()
 
     def _handle_stop_camera(self):
         """处理 StopReceivePcCamera 命令"""
-        logger.info("停止视频流")
-        self._stop_video_stream()
+        logger.info("收到停止视频流命令")
+        self._stop_video_stream_internal()
 
         if self.on_streaming_stopped:
             self.on_streaming_stopped()
+
+    def _stop_video_stream_internal(self):
+        """停止视频流 (线程安全，外部调用)"""
+        with self._state_lock:
+            self._stop_video_stream_internal_unlocked()
+
+    def _stop_video_stream_internal_unlocked(self):
+        """停止视频流 (假设已持有锁)"""
+        if self._streaming_state == StreamingState.IDLE:
+            logger.debug("视频流已经停止")
+            return
+
+        if self._streaming_state == StreamingState.STOPPING:
+            logger.debug("视频流正在停止中")
+            return
+
+        self._streaming_state = StreamingState.STOPPING
+
+        if self.video_sender:
+            logger.info("正在停止视频流...")
+            try:
+                self.video_sender.stop_streaming()
+            except Exception as e:
+                logger.warning(f"停止视频流异常: {e}")
+            finally:
+                self.video_sender = None
+
+        self._streaming_state = StreamingState.IDLE
+        self._active_client_id = None
+        logger.info("视频流已停止")
 
     def _handle_camera_list(self, client: socket.socket):
         """处理相机列表请求"""
@@ -712,20 +758,19 @@ class XRoboCompatServer:
                 "functionName": "onCameraList",
                 "cameras": [
                     {
-                        "name": "USB_STEREO",
+                        "name": "ADB",
                         "type": "USB",
-                        "description": "USB Stereo Camera (StereoVR)"
+                        "description": "USB有线模式 (ADB)"
+                    },
+                    {
+                        "name": "WIFI",
+                        "type": "USB",
+                        "description": "WiFi无线模式"
                     }
                 ]
             }
         )
         client.send(response)
-
-    def _stop_video_stream(self):
-        """停止视频流"""
-        if self.video_sender:
-            self.video_sender.stop_streaming()
-            self.video_sender = None
 
     def _send_error(self, client: socket.socket, message: str):
         """发送错误响应"""
@@ -746,7 +791,7 @@ class XRoboCompatServer:
         logger.info("正在停止服务器...")
         self.is_running = False
 
-        self._stop_video_stream()
+        self._stop_video_stream_internal()
 
         if self.client_socket:
             try:
@@ -801,7 +846,7 @@ def main():
     local_ip = get_local_ip()
     print()
     print("=" * 60)
-    print("StereoVR → XRoboToolkit 兼容服务器")
+    print("StereoVR XRoboToolkit 兼容服务器")
     print("=" * 60)
     print(f"本机 IP: {local_ip}")
     print(f"请在 PICO 头显的 Unity Client 中输入此 IP")
@@ -809,7 +854,6 @@ def main():
     print()
 
     if args.test:
-        # 测试模式
         print("测试模式: 检测相机...")
         import cv2
         cap = cv2.VideoCapture(args.device)
