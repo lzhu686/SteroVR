@@ -622,6 +622,50 @@ class XRoboCompatServer:
         """处理 OpenCamera 命令"""
         self._start_video_stream(params, client)
 
+    def _wait_for_media_decoder(self, target_ip: str, target_port: int,
+                                 timeout: float = 5.0, interval: float = 0.1) -> bool:
+        """
+        方案 B: 主动探测 MediaDecoder 是否已启动 TCP 监听
+
+        原理: 尝试 TCP 连接，如果成功则说明 MediaDecoder 已准备好
+
+        参数:
+            target_ip: 目标 IP (ADB 模式下为 127.0.0.1)
+            target_port: 目标端口 (默认 12345)
+            timeout: 最大等待时间 (秒)
+            interval: 探测间隔 (秒)
+
+        返回:
+            True: MediaDecoder 已就绪
+            False: 超时未就绪
+        """
+        logger.info(f"探测 MediaDecoder 是否就绪: {target_ip}:{target_port}")
+        start_time = time.time()
+        attempt = 0
+
+        while time.time() - start_time < timeout:
+            attempt += 1
+            try:
+                # 尝试连接
+                probe_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                probe_socket.settimeout(0.3)  # 短超时
+                probe_socket.connect((target_ip, target_port))
+                probe_socket.close()
+
+                elapsed = time.time() - start_time
+                logger.info(f"MediaDecoder 已就绪! (探测 {attempt} 次, 耗时 {elapsed:.2f}s)")
+                return True
+
+            except (ConnectionRefusedError, socket.timeout, OSError):
+                # 连接被拒绝或超时，说明还没准备好
+                pass
+
+            time.sleep(interval)
+
+        elapsed = time.time() - start_time
+        logger.warning(f"MediaDecoder 探测超时 (尝试 {attempt} 次, 耗时 {elapsed:.1f}s)")
+        return False
+
     def _start_video_stream(self, params: dict, client: socket.socket):
         """
         启动视频流 (线程安全)
@@ -657,19 +701,19 @@ class XRoboCompatServer:
         target_ip = params.get('clientIp', params.get('ip', ''))
         target_port = params.get('clientPort', params.get('port', 12345))
 
-        # 等待 PICO MediaDecoder 准备好
-        # MediaDecoder.startServer() 需要一些时间来启动 TCP 监听
-        # 这个延迟是关键，否则会出现 Broken pipe
-        logger.info("等待 PICO MediaDecoder 启动监听...")
-        wait_time = 3.0  # 增加到 3 秒，确保 MediaDecoder 准备好
-        logger.info(f"等待 {wait_time} 秒...")
-        time.sleep(wait_time)
-
-        # ADB 模式处理
+        # ADB 模式处理 (需要先处理，因为探测需要正确的 IP)
         if self.adb_connected:
             logger.info(f"ADB 模式: 将目标 IP 从 {target_ip} 改为 127.0.0.1")
             target_ip = "127.0.0.1"
             self._setup_adb_forward(target_port)
+
+        # 方案 B: 主动探测 MediaDecoder 是否准备好
+        # 替代固定 3 秒等待，最快 ~0.1 秒，最慢 5 秒超时
+        if not self._wait_for_media_decoder(target_ip, target_port):
+            logger.error("MediaDecoder 未就绪，无法启动视频流")
+            self._send_error(client, "MediaDecoder not ready (timeout)")
+            self._set_state(StreamingState.IDLE)
+            return
 
         logger.info(f"启动视频流: {target_ip}:{target_port}")
         logger.info(f"参数: {params.get('width', 2560)}x{params.get('height', 720)} @ "
