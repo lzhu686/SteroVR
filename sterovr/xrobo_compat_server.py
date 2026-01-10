@@ -655,12 +655,18 @@ class XRoboCompatServer:
         target_ip = params.get('clientIp', params.get('ip', ''))
         target_port = params.get('clientPort', params.get('port', 12345))
 
+        # 等待 PICO MediaDecoder 准备好
+        # MediaDecoder.startServer() 需要一些时间来启动 TCP 监听
+        # 这个延迟是关键，否则会出现 Broken pipe
+        logger.info("等待 PICO MediaDecoder 启动监听...")
+        wait_time = 3.0  # 增加到 3 秒，确保 MediaDecoder 准备好
+        logger.info(f"等待 {wait_time} 秒...")
+        time.sleep(wait_time)
+
         # ADB 模式处理
         if self.adb_connected:
             logger.info(f"ADB 模式: 将目标 IP 从 {target_ip} 改为 127.0.0.1")
             target_ip = "127.0.0.1"
-            logger.info("等待 PICO MediaDecoder 启动监听 (2秒)...")
-            time.sleep(2.0)
             self._setup_adb_forward(target_port)
 
         logger.info(f"启动视频流: {target_ip}:{target_port}")

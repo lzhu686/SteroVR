@@ -356,19 +356,37 @@ class SimpleH264Sender:
                 self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-                # 设置发送超时，防止 sendall 无限阻塞
-                self.tcp_socket.settimeout(StreamingConstants.SEND_TIMEOUT_SECONDS)
+                # 设置连接超时
+                self.tcp_socket.settimeout(5.0)
 
                 self.tcp_socket.connect((target_ip, target_port))
+
+                # 连接成功后设置发送超时
+                self.tcp_socket.settimeout(StreamingConstants.SEND_TIMEOUT_SECONDS)
+
                 logger.info(f"TCP 连接成功: {target_ip}:{target_port}")
                 return True
+            except socket.timeout:
+                logger.warning(f"TCP 连接超时 ({attempt+1}/{StreamingConstants.TCP_RETRY_COUNT})")
+                logger.info(f"  -> 请确认 PICO 端 MediaDecoder 已启动监听 {target_port} 端口")
+            except ConnectionRefusedError:
+                logger.warning(f"TCP 连接被拒绝 ({attempt+1}/{StreamingConstants.TCP_RETRY_COUNT})")
+                logger.info(f"  -> PICO 端的 MediaDecoder.startServer() 可能尚未执行")
+                logger.info(f"  -> 或者端口 {target_port} 被其他进程占用")
             except Exception as e:
-                if attempt < StreamingConstants.TCP_RETRY_COUNT - 1:
-                    logger.warning(f"TCP 连接失败 ({attempt+1}/{StreamingConstants.TCP_RETRY_COUNT}): {e}")
-                    time.sleep(retry_delay)
-                    retry_delay *= 1.5
-                else:
-                    logger.error(f"TCP 连接失败，已达最大重试次数: {e}")
+                logger.warning(f"TCP 连接失败 ({attempt+1}/{StreamingConstants.TCP_RETRY_COUNT}): {e}")
+
+            if attempt < StreamingConstants.TCP_RETRY_COUNT - 1:
+                logger.info(f"等待 {retry_delay:.1f} 秒后重试...")
+                time.sleep(retry_delay)
+                retry_delay *= 1.5
+
+        logger.error(f"TCP 连接失败，已达最大重试次数 ({StreamingConstants.TCP_RETRY_COUNT})")
+        logger.error(f"请检查:")
+        logger.error(f"  1. PICO 端 Unity Client 是否已点击 Listen 按钮")
+        logger.error(f"  2. PICO IP 是否正确 (当前: {target_ip})")
+        logger.error(f"  3. 端口 {target_port} 是否正确")
+        logger.error(f"  4. 防火墙是否允许此端口")
         return False
 
     def _start_ffmpeg(self) -> bool:
@@ -591,10 +609,11 @@ class SimpleH264Sender:
             self.stats['bytes_sent'] += len(packet)
             self.stats['last_frame_time'] = time.time()
 
-            # 前几帧输出调试信息
-            if self.stats['frames_sent'] <= 3:
+            # 前 10 帧输出详细调试信息
+            if self.stats['frames_sent'] <= 10:
                 hex_preview = frame_data[:20].hex()
-                logger.info(f"[Frame {self.stats['frames_sent']}] {len(frame_data)} bytes, {hex_preview}...")
+                logger.info(f"[Frame {self.stats['frames_sent']}] {len(frame_data)} bytes, "
+                           f"发送耗时: {send_time_ms:.1f}ms, hex: {hex_preview}...")
 
         except socket.timeout:
             self._consecutive_send_failures += 1
@@ -605,6 +624,11 @@ class SimpleH264Sender:
 
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
             logger.error(f"连接断开: {e}")
+            logger.error(f"已发送 {self.stats['frames_sent']} 帧, 共 {self.stats['bytes_sent']} 字节")
+            logger.error(f"可能原因:")
+            logger.error(f"  1. PICO 端 MediaDecoder 崩溃或被关闭")
+            logger.error(f"  2. Unity Client 被切到后台")
+            logger.error(f"  3. 网络断开")
             self._handle_connection_lost(str(e))
 
         except OSError as e:
@@ -624,21 +648,30 @@ class SimpleH264Sender:
         行为:
         1. 记录断开事件
         2. 停止发送循环
-        3. 触发回调 (如果设置了)
+        3. 在单独线程中触发回调 (避免 join 自己的问题)
+
+        关键: 回调在新线程中执行，因为当前是 _send_loop 线程，
+              如果回调中调用 stop_streaming() 会导致 join 自己。
         """
         self.stats['connection_lost_count'] += 1
-        logger.error(f"❌ 连接断开 (第 {self.stats['connection_lost_count']} 次): {reason}")
-        logger.info(f"💡 提示: PICO 端可能进入休眠或 Unity Client 被切到后台")
+        logger.error(f"连接断开 (第 {self.stats['connection_lost_count']} 次): {reason}")
+        logger.info(f"提示: PICO 端可能进入休眠或 Unity Client 被切到后台")
 
         # 停止发送循环
         self.is_running = False
 
-        # 触发回调
+        # 在新线程中触发回调，避免 "cannot join current thread" 错误
         if self.on_connection_lost:
-            try:
-                self.on_connection_lost(reason)
-            except Exception as e:
-                logger.warning(f"连接断开回调执行失败: {e}")
+            def delayed_callback():
+                try:
+                    # 等待当前线程退出后再执行回调
+                    time.sleep(0.1)
+                    self.on_connection_lost(reason)
+                except Exception as e:
+                    logger.warning(f"连接断开回调执行失败: {e}")
+
+            callback_thread = threading.Thread(target=delayed_callback, daemon=True)
+            callback_thread.start()
 
     def get_network_stats(self) -> dict:
         """
@@ -662,25 +695,57 @@ class SimpleH264Sender:
     # ============== 清理 ==============
 
     def stop_streaming(self):
-        """停止传输并清理资源"""
+        """
+        停止传输并清理资源
+
+        关键: 必须确保 FFmpeg 进程被终止，否则相机会被锁定。
+        即使其他步骤失败，也要尽力释放 FFmpeg。
+        """
         logger.info("正在停止视频流...")
         self.is_running = False
 
+        # 1. 等待发送线程结束 (可选，不阻塞清理)
         if self.send_thread:
-            self.send_thread.join(timeout=2)
+            # 检查是否是当前线程在调用 (避免 join 自己)
+            if threading.current_thread() != self.send_thread:
+                try:
+                    self.send_thread.join(timeout=2)
+                except Exception as e:
+                    logger.warning(f"等待发送线程结束失败: {e}")
+            else:
+                logger.debug("当前线程是发送线程，跳过 join")
 
+        # 2. 关键: 必须终止 FFmpeg 以释放相机
         if self.ffmpeg_process:
-            self.ffmpeg_process.terminate()
             try:
-                self.ffmpeg_process.wait(timeout=2)
-            except:
-                self.ffmpeg_process.kill()
+                logger.info("正在终止 FFmpeg 进程...")
+                self.ffmpeg_process.terminate()
+                try:
+                    self.ffmpeg_process.wait(timeout=2)
+                    logger.info("FFmpeg 进程已正常终止")
+                except subprocess.TimeoutExpired:
+                    logger.warning("FFmpeg 未响应 terminate，强制 kill...")
+                    self.ffmpeg_process.kill()
+                    self.ffmpeg_process.wait(timeout=1)
+                    logger.info("FFmpeg 进程已强制终止")
+            except Exception as e:
+                logger.error(f"终止 FFmpeg 失败: {e}")
+                # 最后尝试: 强制 kill
+                try:
+                    self.ffmpeg_process.kill()
+                except:
+                    pass
+            finally:
+                self.ffmpeg_process = None
 
+        # 3. 关闭 TCP socket
         if self.tcp_socket:
             try:
                 self.tcp_socket.close()
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"关闭 socket: {e}")
+            finally:
+                self.tcp_socket = None
 
         # 输出完整统计
         elapsed = time.time() - self.stats['start_time'] if self.stats['start_time'] > 0 else 0
@@ -697,6 +762,7 @@ class SimpleH264Sender:
         logger.info(f"  平均发送耗时: {net_stats['avg_send_time_ms']:.1f} ms")
         logger.info(f"  最大发送耗时: {net_stats['max_send_time_ms']:.1f} ms")
         logger.info("=" * 60)
+        logger.info("相机资源已释放")
 
 
 # ============== 测试入口 ==============
