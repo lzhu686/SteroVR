@@ -430,232 +430,283 @@ Manus 手套 (21 DoF):                    灵巧手 (20 DoF):
 
 ---
 
-## 时间同步策略
+## 数据采集策略 (V2 - 独立采集)
 
-### 核心原则：机器人端必须硬同步
+### 核心原则：先跑通 Pipeline，时间同步后处理
 
-**关键洞察**: 对于模仿学习数据采集，最重要的是确保 **机器人端数据的严格同步**：
+**实际考虑**:
+- 视觉作为 encoder，推理频率 ~30Hz
+- 机器人 action 控制频率 ~2000Hz
+- **不应该因为视觉慢就把所有数据都降采样到 30Hz**
+- 时间同步是后处理问题，不是采集时的问题
+
+### 采集策略：每个 Topic 独立采集
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                           机器人端硬同步要求                                              │
+│                           独立采集策略 (V2)                                               │
 ├─────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                         │
-│   在同一物理时刻 t，必须同时采集:                                                         │
+│   原则:                                                                                  │
+│   1. 每个 topic 独立采集，保留原始频率                                                    │
+│   2. 所有数据加本地时间戳 (同一台机器的时钟)                                              │
+│   3. 时间对齐在后处理/训练时按需进行                                                      │
 │                                                                                         │
-│   ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐                      │
-│   │  机械臂关节角    │   │  灵巧手关节角    │   │  腕部相机画面    │                      │
-│   │  (14 DoF)       │   │  (40 DoF)       │   │  (2 images)     │                      │
-│   └────────┬────────┘   └────────┬────────┘   └────────┬────────┘                      │
-│            │                     │                     │                               │
-│            └─────────────────────┼─────────────────────┘                               │
-│                                  ▼                                                      │
-│                        ┌─────────────────┐                                             │
-│                        │  同一时间戳 t   │                                             │
-│                        │  (硬件触发同步)  │                                             │
-│                        └─────────────────┘                                             │
+│   ┌─────────────────────────────────────────────────────────────────────────────────┐  │
+│   │  Topic                          │ 原始频率 │ 存储格式                            │  │
+│   ├─────────────────────────────────┼──────────┼────────────────────────────────────┤  │
+│   │  /robot/arm/joint_states        │ 2000 Hz  │ arrow/parquet (高频数值)           │  │
+│   │  /robot/hand/joint_states       │ 500 Hz   │ arrow/parquet                      │  │
+│   │  /robot/camera/wrist_*          │ 30 Hz    │ mp4 / 图像序列                      │  │
+│   │  /teleop/pico/tracker/*         │ 200 Hz   │ arrow/parquet                      │  │
+│   │  /teleop/manus/*/joint_states   │ 90 Hz    │ arrow/parquet                      │  │
+│   │  /teleop/camera/head/*          │ 60 Hz    │ mp4 / 图像序列                      │  │
+│   └─────────────────────────────────┴──────────┴────────────────────────────────────┘  │
 │                                                                                         │
-│   为什么? 因为这三者定义了机器人在时刻 t 的完整状态:                                       │
-│   • 关节角 → 机器人姿态                                                                  │
-│   • 相机画面 → 该姿态下看到的场景                                                         │
-│                                                                                         │
-│   如果不同步，训练数据会有因果错位！                                                      │
+│   每条记录包含:                                                                          │
+│   • timestamp (float64): 本地时间戳 (纳秒精度)                                           │
+│   • data: 原始数据                                                                       │
 │                                                                                         │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 时钟域分析
+### 为什么不在采集时同步？
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                              时钟域分析                                                  │
+│                              异步推理场景                                                 │
 ├─────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                         │
-│   时钟域 A: PC                    时钟域 B: 机器人控制器           时钟域 C: PICO        │
-│   ┌─────────────────────┐        ┌─────────────────────┐        ┌─────────────────────┐│
-│   │ • 头部双目相机       │        │ • 双臂关节编码器     │        │ • HMD/Tracker       ││
-│   │ • Manus SDK         │        │ • 灵巧手关节编码器   │        │ • 通过 gRPC 同步    ││
-│   │ • ROS2 节点         │        │ • 腕部相机          │        │                     ││
-│   └─────────────────────┘        └─────────┬───────────┘        └─────────────────────┘│
-│            │                                │                            │              │
-│            │◀─── NTP/PTP 同步 ────────────▶│◀─── 网络延迟 ─────────────▶│              │
-│                                             │                                           │
-│                                    ┌────────▼────────┐                                  │
-│                                    │  硬件触发同步    │                                  │
-│                                    │  (同一控制周期)  │                                  │
-│                                    └─────────────────┘                                  │
+│   训练/部署时的数据流:                                                                    │
+│                                                                                         │
+│   视觉 (30Hz)    ────→  Vision Encoder  ────→  视觉特征                                 │
+│                                                    │                                    │
+│                                                    ▼                                    │
+│   状态 (2000Hz)  ────→  状态缓存  ────────────→  Policy  ────→  Action (2000Hz)         │
+│                                                                                         │
+│   注意:                                                                                  │
+│   • 视觉特征可以被多个高频 action 复用                                                    │
+│   • 不需要每个 action 都有一帧新图像                                                      │
+│   • 采集时降采样会丢失高频动作信息                                                        │
 │                                                                                         │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 推荐方案：分层时间同步
-
-#### 第一层：机器人端硬同步 (最关键)
-
-机器人控制器内部实现硬件级同步：
+### 简化的采集实现
 
 ```python
+#!/usr/bin/env python3
 """
-机器人端硬同步实现 (在机器人控制器内部)
-
-所有数据在同一个控制周期内采集，共享同一个时间戳
-"""
-
-class RobotStatePublisher:
-    """机器人状态发布器 - 硬同步版本"""
-
-    def control_loop(self):
-        """控制周期回调 (1kHz)"""
-        # 在同一个控制周期内，原子性地读取所有传感器
-        timestamp = self.get_hardware_timestamp()  # 硬件时钟
-
-        # 1. 读取机械臂关节编码器 (同步读取)
-        arm_left_joints = self.arm_left.read_encoders()   # 7 DoF
-        arm_right_joints = self.arm_right.read_encoders() # 7 DoF
-
-        # 2. 读取灵巧手关节编码器 (同步读取)
-        hand_left_joints = self.hand_left.read_encoders()   # 20 DoF
-        hand_right_joints = self.hand_right.read_encoders() # 20 DoF
-
-        # 3. 触发腕部相机采集 (硬件触发，与编码器同步)
-        wrist_left_image = self.wrist_cam_left.capture()   # 硬件触发
-        wrist_right_image = self.wrist_cam_right.capture() # 硬件触发
-
-        # 所有数据使用同一个时间戳发布
-        self.publish_synced_state(
-            timestamp=timestamp,
-            arm_joints=np.concatenate([arm_left_joints, arm_right_joints]),  # 14 DoF
-            hand_joints=np.concatenate([hand_left_joints, hand_right_joints]), # 40 DoF
-            wrist_images=[wrist_left_image, wrist_right_image]
-        )
-```
-
-#### 第二层：跨设备软同步
-
-遥操作端数据 (PICO、Manus、头部相机) 与机器人端数据的对齐：
-
-以**机器人腕部相机 (30Hz)** 作为同步基准，因为它是闭环中最慢且最关键的反馈环节。
-
-```python
-"""
-分层时间同步策略:
-
-1. 底层同步: PTP (IEEE 1588) 或 NTP 保证各设备时钟偏差 < 1ms
-2. 中层同步: ROS2 message_filters 按时间戳对齐
-3. 高层同步: 以机器人腕部相机为基准，统一输出 30Hz
+独立 Topic 采集器 - 每个 topic 独立记录，保留原始频率
 """
 
-import message_filters
+import rclpy
+from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
 from geometry_msgs.msg import PoseStamped
+import time
+import pyarrow as pa
+import pyarrow.parquet as pq
+from pathlib import Path
+from collections import defaultdict
+from threading import Lock
 
 
-class TeleopDataCollector(Node):
-    """分层时间同步的数据采集器"""
+class IndependentDataRecorder(Node):
+    """独立采集每个 topic，不做同步"""
 
     def __init__(self):
-        super().__init__('teleop_data_collector')
+        super().__init__('independent_data_recorder')
 
-        # ========== 第一组：遥操作输入 (高频，需要降采样) ==========
-        self.teleop_subs = [
-            message_filters.Subscriber(self, PoseStamped, '/teleop/pico/tracker/left_wrist'),
-            message_filters.Subscriber(self, PoseStamped, '/teleop/pico/tracker/right_wrist'),
-            message_filters.Subscriber(self, PoseStamped, '/teleop/pico/tracker/left_elbow'),
-            message_filters.Subscriber(self, PoseStamped, '/teleop/pico/tracker/right_elbow'),
-            message_filters.Subscriber(self, JointState, '/teleop/manus/left/joint_states'),
-            message_filters.Subscriber(self, JointState, '/teleop/manus/right/joint_states'),
-        ]
+        self.output_dir = Path('/data/teleop_raw')
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # ========== 第二组：机器人状态 (高频) ==========
-        self.robot_subs = [
-            message_filters.Subscriber(self, JointState, '/robot/arm/left/joint_states'),
-            message_filters.Subscriber(self, JointState, '/robot/arm/right/joint_states'),
-            message_filters.Subscriber(self, JointState, '/robot/hand/left/joint_states'),
-            message_filters.Subscriber(self, JointState, '/robot/hand/right/joint_states'),
-        ]
+        self.recording = False
+        self.episode_id = 0
+        self.buffers = defaultdict(list)  # topic_name -> [(timestamp, data), ...]
+        self.lock = Lock()
 
-        # ========== 第三组：视觉数据 ==========
-        # 头部相机: 遥操作端 (60Hz)
-        # 腕部相机: 机器人端 (30Hz) ← 作为同步基准
-        self.camera_subs = [
-            message_filters.Subscriber(self, Image, '/teleop/camera/head/left/image_raw'),
-            message_filters.Subscriber(self, Image, '/teleop/camera/head/right/image_raw'),
-            message_filters.Subscriber(self, Image, '/robot/camera/wrist_left/image_raw'),   # 机器人端
-            message_filters.Subscriber(self, Image, '/robot/camera/wrist_right/image_raw'),  # 机器人端
-        ]
+        # 订阅所有 topic (独立回调，不做同步)
+        self._setup_subscribers()
 
-        # 所有话题联合同步
-        all_subs = self.teleop_subs + self.robot_subs + self.camera_subs
+        self.get_logger().info('IndependentDataRecorder ready')
 
-        self.sync = message_filters.ApproximateTimeSynchronizer(
-            all_subs,
-            queue_size=10,
-            slop=0.05,  # 50ms 容忍度
-        )
-        self.sync.registerCallback(self.synced_callback)
+    def _get_local_timestamp(self) -> float:
+        """获取本地时间戳 (纳秒精度)"""
+        return time.time_ns() / 1e9
 
-    def synced_callback(
-        self,
-        # 遥操作输入 (6个)
-        left_wrist, right_wrist, left_elbow, right_elbow,
-        manus_left, manus_right,
-        # 机器人状态 (4个)
-        arm_left, arm_right, hand_left, hand_right,
-        # 相机 (4个): 2个来自遥操作端，2个来自机器人端
-        head_left, head_right, wrist_left, wrist_right
-    ):
-        """
-        所有 14 个话题已按时间戳对齐
-        输出频率由最慢的话题 (机器人腕部相机 30Hz) 决定
-        """
-        pass
+    def _setup_subscribers(self):
+        """设置独立订阅器"""
+
+        # 机器人状态 (高频)
+        self.create_subscription(
+            JointState, '/robot/arm/left/joint_states',
+            lambda msg: self._record('robot_arm_left', msg), 10)
+        self.create_subscription(
+            JointState, '/robot/arm/right/joint_states',
+            lambda msg: self._record('robot_arm_right', msg), 10)
+        self.create_subscription(
+            JointState, '/robot/hand/left/joint_states',
+            lambda msg: self._record('robot_hand_left', msg), 10)
+        self.create_subscription(
+            JointState, '/robot/hand/right/joint_states',
+            lambda msg: self._record('robot_hand_right', msg), 10)
+
+        # 遥操作输入
+        self.create_subscription(
+            PoseStamped, '/teleop/pico/tracker/left_wrist',
+            lambda msg: self._record('teleop_left_wrist', msg), 10)
+        self.create_subscription(
+            PoseStamped, '/teleop/pico/tracker/right_wrist',
+            lambda msg: self._record('teleop_right_wrist', msg), 10)
+        self.create_subscription(
+            JointState, '/teleop/manus/left/joint_states',
+            lambda msg: self._record('teleop_manus_left', msg), 10)
+        self.create_subscription(
+            JointState, '/teleop/manus/right/joint_states',
+            lambda msg: self._record('teleop_manus_right', msg), 10)
+
+        # 图像单独处理 (写入视频文件)
+        self.create_subscription(
+            Image, '/robot/camera/wrist_left/image_raw',
+            lambda msg: self._record_image('wrist_left', msg), 10)
+        self.create_subscription(
+            Image, '/robot/camera/wrist_right/image_raw',
+            lambda msg: self._record_image('wrist_right', msg), 10)
+
+    def _record(self, topic_name: str, msg):
+        """记录非图像数据"""
+        if not self.recording:
+            return
+
+        timestamp = self._get_local_timestamp()
+
+        with self.lock:
+            if isinstance(msg, JointState):
+                self.buffers[topic_name].append({
+                    'timestamp': timestamp,
+                    'position': list(msg.position),
+                    'velocity': list(msg.velocity) if msg.velocity else [],
+                })
+            elif isinstance(msg, PoseStamped):
+                p = msg.pose
+                self.buffers[topic_name].append({
+                    'timestamp': timestamp,
+                    'position': [p.position.x, p.position.y, p.position.z],
+                    'orientation': [p.orientation.x, p.orientation.y,
+                                    p.orientation.z, p.orientation.w],
+                })
+
+    def _record_image(self, camera_name: str, msg):
+        """记录图像数据 (写入视频或图像序列)"""
+        if not self.recording:
+            return
+
+        timestamp = self._get_local_timestamp()
+        # TODO: 使用 cv2.VideoWriter 或保存为图像序列
+        # 这里只记录时间戳索引
+        with self.lock:
+            self.buffers[f'camera_{camera_name}'].append({
+                'timestamp': timestamp,
+                'frame_id': len(self.buffers[f'camera_{camera_name}']),
+            })
+
+    def start_recording(self):
+        """开始录制"""
+        self.episode_id += 1
+        self.recording = True
+        with self.lock:
+            self.buffers.clear()
+        self.get_logger().info(f'Started recording episode {self.episode_id}')
+
+    def stop_recording(self):
+        """停止录制并保存"""
+        self.recording = False
+
+        episode_dir = self.output_dir / f'episode_{self.episode_id:04d}'
+        episode_dir.mkdir(exist_ok=True)
+
+        with self.lock:
+            for topic_name, data in self.buffers.items():
+                if not data:
+                    continue
+
+                # 保存为 parquet
+                filepath = episode_dir / f'{topic_name}.parquet'
+                table = pa.Table.from_pylist(data)
+                pq.write_table(table, filepath)
+
+                self.get_logger().info(
+                    f'Saved {topic_name}: {len(data)} samples to {filepath}')
+
+        self.get_logger().info(f'Episode {self.episode_id} saved to {episode_dir}')
 ```
 
-### 关键设计决策
-
-| 问题 | 方案 | 理由 |
-|------|------|------|
-| **以谁的时钟为准？** | 机器人控制器时钟 | 动作执行是核心，其他数据对齐到机器人 |
-| **输出频率？** | 30 Hz | 由最慢的传感器 (机器人腕部相机) 决定 |
-| **同步容忍度？** | 50ms | 人类反应时间 ~100ms，50ms 足够 |
-| **腕部相机归属？** | 机器人端 | 它是机器人的感知设备，与机器人状态同源 |
-
-### 数据对齐图示
+### 存储结构
 
 ```
-时间轴 ──────────────────────────────────────────────────────────────────────────────→
-         t₀         t₁         t₂         t₃         t₄         t₅
-         │          │          │          │          │          │
-         ▼          ▼          ▼          ▼          ▼          ▼
+/data/teleop_raw/
+├── episode_0001/
+│   ├── robot_arm_left.parquet      # 2000Hz, ~120000 samples/min
+│   ├── robot_arm_right.parquet
+│   ├── robot_hand_left.parquet     # 500Hz
+│   ├── robot_hand_right.parquet
+│   ├── teleop_left_wrist.parquet   # 200Hz
+│   ├── teleop_right_wrist.parquet
+│   ├── teleop_manus_left.parquet   # 90Hz
+│   ├── teleop_manus_right.parquet
+│   ├── camera_wrist_left.mp4       # 30Hz
+│   ├── camera_wrist_right.mp4
+│   ├── camera_head_left.mp4        # 60Hz
+│   ├── camera_head_right.mp4
+│   └── metadata.json               # episode 信息
+│
+├── episode_0002/
+│   └── ...
+```
 
-[遥操作端]
-Tracker (200Hz)
-    ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○
-              ↓              ↓              ↓              ↓
-Manus (90Hz)
-    ○     ○     ○     ○     ○     ○     ○     ○     ○     ○     ○     ○
-              ↓              ↓              ↓              ↓
-Head Camera (60Hz)
-    ○        ○        ○        ○        ○        ○        ○        ○
-              ↓              ↓              ↓              ↓
+### 后处理：按需对齐
 
-[机器人端]
-Robot State (200Hz)
-    ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○  ○
-              ↓              ↓              ↓              ↓
-Wrist Camera (30Hz) ◀─── 同步基准 (机器人端)
-    ●                 ●                 ●                 ●
-    │                 │                 │                 │
-    ▼                 ▼                 ▼                 ▼
+训练时根据需要进行时间对齐：
 
-[输出]
-Synced Data (30Hz)
-    █                 █                 █                 █
+```python
+import pandas as pd
+import numpy as np
 
-    每个 █ 包含:
-    • /teleop/* 数据 (最近邻采样)
-    • /robot/* 数据 (最近邻采样)
-    • 4 张图像 (时间戳在 50ms 内)
+def align_to_vision(robot_df: pd.DataFrame, vision_timestamps: np.ndarray):
+    """
+    将高频机器人数据对齐到视觉帧时间戳
+    使用最近邻插值
+    """
+    aligned = []
+    for vt in vision_timestamps:
+        # 找到最近的机器人状态
+        idx = np.argmin(np.abs(robot_df['timestamp'].values - vt))
+        aligned.append(robot_df.iloc[idx])
+
+    return pd.DataFrame(aligned)
+
+
+def create_training_dataset(episode_dir: Path, vision_hz: int = 30):
+    """
+    创建训练数据集
+    视觉为基准，其他数据对齐到视觉时间戳
+    """
+    # 加载各个 topic
+    arm_left = pd.read_parquet(episode_dir / 'robot_arm_left.parquet')
+    arm_right = pd.read_parquet(episode_dir / 'robot_arm_right.parquet')
+    # ...
+
+    # 以视觉时间戳为基准
+    vision_meta = pd.read_parquet(episode_dir / 'camera_wrist_left.parquet')
+    vision_timestamps = vision_meta['timestamp'].values
+
+    # 对齐高频数据到视觉时间戳
+    arm_left_aligned = align_to_vision(arm_left, vision_timestamps)
+    arm_right_aligned = align_to_vision(arm_right, vision_timestamps)
+
+    # 合并为训练数据
+    # ...
 ```
 
 ---
@@ -1206,6 +1257,7 @@ dataset = RobomimicLowdimDataset(
 | **输入自由度** | 4x6DoF (Trackers) + 2x21DoF (Manus) = **66 DoF** |
 | **输出自由度** | 2x7DoF (Arms) + 2x20DoF (Hands) = **54 DoF** |
 | **相机数量** | 4 (头部左右 + 腕部左右) |
-| **采集频率** | 30 Hz (同步输出) |
-| **存储格式** | HDF5 (ACT/Diffusion Policy 兼容) |
-| **时间同步** | message_filters (50ms slop) |
+| **采集策略** | **V2: 独立采集** (各 topic 原始频率) |
+| **时间同步** | 本地时间戳 (纳秒精度)，后处理对齐 |
+| **存储格式** | Parquet (数值) + MP4 (视频) |
+| **训练对齐** | 以视觉帧 (30Hz) 为基准，高频数据用最近邻插值 |
