@@ -70,8 +70,8 @@ def check_opencv() -> bool:
         return False
 
 
-def list_cameras() -> list:
-    """列出可用的相机设备"""
+def list_cameras_legacy() -> list:
+    """列出可用的相机设备 (旧版兼容)"""
     import cv2
     cameras = []
     for i in range(10):
@@ -87,6 +87,12 @@ def list_cameras() -> list:
                 })
             cap.release()
     return cameras
+
+
+def select_camera_interactive():
+    """交互式选择相机"""
+    from teleopVision.camera_utils import list_cameras, select_camera_interactive as _select
+    return _select()
 
 
 def print_banner():
@@ -118,10 +124,21 @@ def print_status(text: str, ok: bool):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='StereoVR XRoboToolkit 兼容服务器启动脚本'
+        description='StereoVR XRoboToolkit 兼容服务器启动脚本',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python start_xrobo_compat.py                      # 使用默认设备 0
+  python start_xrobo_compat.py --select             # 交互式选择相机
+  python start_xrobo_compat.py --device 2           # 使用设备索引 2
+  python start_xrobo_compat.py --device /dev/video4 # 使用设备路径 (Linux)
+  python start_xrobo_compat.py --list-cameras       # 列出所有相机
+"""
     )
-    parser.add_argument('--device', '-d', type=int, default=0,
-                        help='相机设备 ID (默认: 0)')
+    parser.add_argument('--device', '-d', type=str, default='0',
+                        help='相机设备 (索引如 0, 2 或路径如 /dev/video4)')
+    parser.add_argument('--select', '-s', action='store_true',
+                        help='交互式选择相机')
     parser.add_argument('--width', '-W', type=int, default=2560,
                         help='视频宽度 (默认: 2560)')
     parser.add_argument('--height', '-H', type=int, default=720,
@@ -132,7 +149,7 @@ def main():
                         help='码率 (默认: 8000000)')
     parser.add_argument('--check', action='store_true',
                         help='仅检查依赖，不启动服务器')
-    parser.add_argument('--list-cameras', action='store_true',
+    parser.add_argument('--list-cameras', '-l', action='store_true',
                         help='列出可用相机')
 
     args = parser.parse_args()
@@ -168,10 +185,11 @@ def main():
     # 列出相机
     if args.list_cameras:
         print("📷 检测可用相机...\n")
+        from teleopVision.camera_utils import list_cameras
         cameras = list_cameras()
         if cameras:
             for cam in cameras:
-                print(f"   设备 {cam['id']}: {cam['resolution']}")
+                print(f"   {cam}")
         else:
             print("   未检测到相机设备")
         print()
@@ -179,6 +197,21 @@ def main():
 
     if args.check:
         sys.exit(0)
+
+    # 交互式选择相机
+    selected_device = args.device
+    if args.select:
+        cam = select_camera_interactive()
+        if cam is None:
+            print("\n❌ 未选择相机，退出")
+            sys.exit(1)
+        selected_device = cam.device_path
+        print(f"\n✅ 已选择: {cam.name}")
+        print(f"   设备路径: {cam.device_path}\n")
+    else:
+        # 解析设备参数 (支持数字或路径)
+        if selected_device.isdigit():
+            selected_device = int(selected_device)
 
     # 获取网络信息
     local_ip = get_local_ip()
@@ -188,7 +221,7 @@ def main():
     print("=" * 60)
     print(f"   Local IP: {local_ip}")
     print(f"   TCP Port: 13579 (control)")
-    print(f"   Camera Device: {args.device}")
+    print(f"   Camera Device: {selected_device}")
     print(f"   Resolution: {args.width}x{args.height}")
     print(f"   FPS: {args.fps}")
     print(f"   Bitrate: {args.bitrate // 1000000} Mbps")
@@ -210,7 +243,7 @@ def main():
 
     try:
         from teleopVision.xrobo_compat_server import XRoboCompatServer
-        server = XRoboCompatServer(device_id=args.device)
+        server = XRoboCompatServer(device_id=selected_device)
         server.start()
     except KeyboardInterrupt:
         print("\n\n👋 收到中断信号，正在停止...")

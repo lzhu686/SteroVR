@@ -377,7 +377,15 @@ class XRoboCompatServer:
     5. 收到 CLOSE_CAMERA 或客户端断开时停止
     """
 
-    def __init__(self, device_id: int = 0):
+    def __init__(self, device_id: int | str = 0):
+        """
+        初始化 XRoboToolkit 兼容服务器
+
+        参数:
+            device_id: 相机设备标识，支持:
+                - int: 设备索引 (0, 1, 2...)
+                - str: 设备路径 (Linux: "/dev/video0", Windows: "video=Name")
+        """
         self.device_id = device_id
         self.tcp_server: Optional[socket.socket] = None
         self.client_socket: Optional[socket.socket] = None
@@ -960,9 +968,9 @@ def main():
     )
     parser.add_argument(
         '--device', '-d',
-        type=int,
-        default=0,
-        help='相机设备 ID (默认: 0)'
+        type=str,
+        default='0',
+        help='相机设备 (索引如 0, 2 或路径如 /dev/video4)'
     )
     parser.add_argument(
         '--test',
@@ -971,6 +979,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # 解析设备参数 (支持数字或路径)
+    device = int(args.device) if args.device.isdigit() else args.device
 
     # 显示本机 IP
     local_ip = get_local_ip()
@@ -986,7 +997,9 @@ def main():
     if args.test:
         print("测试模式: 检测相机...")
         import cv2
-        cap = cv2.VideoCapture(args.device)
+        # 对于路径，需要提取数字用于 OpenCV
+        cv_device = device if isinstance(device, int) else int(device.split('video')[-1]) if 'video' in str(device) else 0
+        cap = cv2.VideoCapture(cv_device)
         if cap.isOpened():
             ret, frame = cap.read()
             if ret:
@@ -997,7 +1010,7 @@ def main():
         return
 
     # 启动服务器
-    server = XRoboCompatServer(device_id=args.device)
+    server = XRoboCompatServer(device_id=device)
 
     try:
         server.start()

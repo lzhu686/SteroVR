@@ -118,8 +118,9 @@ class SimpleH264Sender:
         self.is_running = False
         self.send_thread: Optional[threading.Thread] = None
         self.device_id = 0
+        self.device_path = ""   # 设备路径 (Linux: /dev/video0, Windows: video=Name)
         self.actual_fps = 30.0
-        self.camera_name = ""  # Windows DirectShow 设备名
+        self.camera_name = ""   # Windows DirectShow 设备名 (兼容旧代码)
 
         # 连接信息 (用于重连)
         self._target_ip = ""
@@ -222,28 +223,56 @@ class SimpleH264Sender:
 
     # ============== 相机初始化 ==============
 
-    def initialize(self, device_id: int = 0) -> bool:
+    def initialize(self, device: int | str = 0) -> bool:
         """
         初始化相机
 
+        参数:
+            device: 设备标识，支持以下格式:
+                - int: 设备索引 (0, 1, 2...)
+                - str (Linux): 设备路径 ("/dev/video0", "/dev/video13")
+                - str (Windows): DirectShow 设备名 ("video=Camera Name")
+
         步骤:
-        1. 用 OpenCV 测试相机是否可用
-        2. 获取相机实际支持的分辨率和帧率
-        3. 关闭 OpenCV，让 FFmpeg 独占相机
-        4. (Windows) 获取 DirectShow 设备名称
+        1. 解析设备标识
+        2. 用 OpenCV 测试相机是否可用
+        3. 获取相机实际支持的分辨率和帧率
+        4. 关闭 OpenCV，让 FFmpeg 独占相机
         """
-        logger.info(f"初始化相机 (设备: {device_id})...")
-        self.device_id = device_id
+        # 解析设备标识
+        if isinstance(device, str):
+            if sys.platform == 'win32':
+                # Windows: 直接使用设备名
+                self.device_path = device if device.startswith('video=') else f"video={device}"
+                self.camera_name = self.device_path
+                # 尝试从设备名提取索引用于 OpenCV
+                self.device_id = self._find_device_index_windows(device)
+            else:
+                # Linux: 使用设备路径
+                self.device_path = device
+                # 从路径提取数字用于 OpenCV
+                import re
+                match = re.search(r'/dev/video(\d+)', device)
+                self.device_id = int(match.group(1)) if match else 0
+        else:
+            # 数字索引
+            self.device_id = device
+            if sys.platform == 'win32':
+                self.device_path = ""  # 稍后获取
+            else:
+                self.device_path = f"/dev/video{device}"
+
+        logger.info(f"初始化相机 (设备: {device}, 路径: {self.device_path or '待获取'})...")
 
         # 用 OpenCV 测试相机
-        test_cap = cv2.VideoCapture(device_id)
+        test_cap = cv2.VideoCapture(self.device_id)
         test_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
         test_cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
         test_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
         test_cap.set(cv2.CAP_PROP_FPS, self.config.fps)
 
         if not test_cap.isOpened():
-            logger.error("无法打开相机")
+            logger.error(f"无法打开相机: {device}")
             return False
 
         # 获取实际参数 (相机可能不支持请求的值)
@@ -255,15 +284,51 @@ class SimpleH264Sender:
         # 关闭 OpenCV，让 FFmpeg 独占
         test_cap.release()
 
-        # Windows: 获取 DirectShow 设备名称
-        if sys.platform == 'win32':
-            self.camera_name = self._get_windows_camera_name(device_id)
-            if not self.camera_name:
-                self.camera_name = f"video={device_id}"
+        # Windows: 获取 DirectShow 设备名称 (如果还没有)
+        if sys.platform == 'win32' and not self.device_path:
+            self.camera_name = self._get_windows_camera_name(self.device_id)
+            if self.camera_name:
+                self.device_path = self.camera_name
+            else:
+                self.device_path = f"video={self.device_id}"
+                self.camera_name = self.device_path
                 logger.warning(f"无法获取相机名称，使用默认: {self.camera_name}")
 
-        logger.info("相机初始化成功 (将使用 FFmpeg 直接采集)")
+        logger.info(f"相机初始化成功 (设备路径: {self.device_path})")
         return True
+
+    def _find_device_index_windows(self, device_name: str) -> int:
+        """Windows: 根据设备名查找设备索引"""
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-hide_banner', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'],
+                capture_output=True, text=True, timeout=10
+            )
+            lines = result.stderr.split('\n')
+            video_devices = []
+            in_video_section = False
+
+            for line in lines:
+                if 'DirectShow video devices' in line:
+                    in_video_section = True
+                    continue
+                if 'DirectShow audio devices' in line:
+                    break
+                if in_video_section and '"' in line and 'Alternative name' not in line:
+                    import re
+                    match = re.search(r'"([^"]+)"', line)
+                    if match:
+                        video_devices.append(match.group(1))
+
+            # 查找匹配的设备
+            search_name = device_name.replace('video=', '')
+            for idx, name in enumerate(video_devices):
+                if name == search_name or search_name in name:
+                    return idx
+
+        except Exception as e:
+            logger.warning(f"查找Windows设备索引失败: {e}")
+        return 0
 
     def _get_windows_camera_name(self, device_id: int) -> Optional[str]:
         """
@@ -429,7 +494,7 @@ class SimpleH264Sender:
                 '-video_size', f'{self.config.width}x{self.config.height}',
                 '-framerate', str(actual_fps),
                 '-vcodec', 'mjpeg',
-                '-i', self.camera_name,
+                '-i', self.device_path,  # 使用设备路径
             ]
         else:
             input_args = [
@@ -437,7 +502,7 @@ class SimpleH264Sender:
                 '-input_format', 'mjpeg',
                 '-video_size', f'{self.config.width}x{self.config.height}',
                 '-framerate', str(actual_fps),
-                '-i', f'/dev/video{self.device_id}',
+                '-i', self.device_path,  # 使用设备路径 (如 /dev/video13)
             ]
 
         ffmpeg_cmd = ['ffmpeg', '-y'] + input_args + encoder_args + ['-f', 'h264', '-']
