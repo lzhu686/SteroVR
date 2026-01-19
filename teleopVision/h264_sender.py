@@ -953,7 +953,7 @@ class LoopbackCapturer:
 
     def initialize(self, device: int | str = 0) -> bool:
         """
-        初始化相机 (与 SimpleH264Sender.initialize 相同逻辑)
+        初始化相机 (Linux 专用)
         """
         import os
         import re
@@ -962,39 +962,25 @@ class LoopbackCapturer:
 
         # 解析设备标识
         if isinstance(device, str):
-            if sys.platform == 'win32':
-                self.device_path = device if device.startswith('video=') else f"video={device}"
-                self.device_id = 0
+            # 解析符号链接获取实际设备路径
+            if os.path.islink(device):
+                real_path = os.path.realpath(device)
+                logger.info(f"[LoopbackCapturer] 符号链接 {device} -> {real_path}")
+                self.device_path = real_path
             else:
-                # Linux: 先解析符号链接获取实际设备路径
-                if os.path.islink(device):
-                    real_path = os.path.realpath(device)
-                    logger.info(f"[LoopbackCapturer] 符号链接 {device} -> {real_path}")
-                    self.device_path = real_path
-                else:
-                    self.device_path = device
+                self.device_path = device
 
-                # 从实际路径提取设备号 (仅用于日志)
-                match = re.search(r'/dev/video(\d+)', self.device_path)
-                if match:
-                    self.device_id = int(match.group(1))
-                else:
-                    self.device_id = -1
+            # 从路径提取设备号 (仅用于日志)
+            match = re.search(r'/dev/video(\d+)', self.device_path)
+            self.device_id = int(match.group(1)) if match else -1
         else:
             self.device_id = device
-            if sys.platform == 'win32':
-                self.device_path = ""
-            else:
-                self.device_path = f"/dev/video{device}"
+            self.device_path = f"/dev/video{device}"
 
         logger.info(f"[LoopbackCapturer] 设备路径: {self.device_path}, 设备ID: {self.device_id}")
 
-        # 用 OpenCV 测试相机
-        # Linux: 直接使用设备路径字符串打开，不要用索引号
-        if sys.platform != 'win32' and self.device_path:
-            test_cap = cv2.VideoCapture(self.device_path)
-        else:
-            test_cap = cv2.VideoCapture(self.device_id)
+        # 用 OpenCV 测试相机 (直接使用设备路径)
+        test_cap = cv2.VideoCapture(self.device_path)
         test_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
         test_cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
         test_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
