@@ -377,7 +377,9 @@ class XRoboCompatServer:
     5. 收到 CLOSE_CAMERA 或客户端断开时停止
     """
 
-    def __init__(self, device_id: int | str = 0):
+    def __init__(self, device_id: int | str = 0,
+                 loopback_device: Optional[str] = None,
+                 loopback_fps: int = 30):
         """
         初始化 XRoboToolkit 兼容服务器
 
@@ -385,8 +387,13 @@ class XRoboCompatServer:
             device_id: 相机设备标识，支持:
                 - int: 设备索引 (0, 1, 2...)
                 - str: 设备路径 (Linux: "/dev/video0", Windows: "video=Name")
+            loopback_device: V4L2 Loopback 设备路径 (如 /dev/stereo_camera)
+                             用于向独立的 ROS2 发布进程输出视频
+            loopback_fps: Loopback 输出帧率 (默认 30fps)
         """
         self.device_id = device_id
+        self.loopback_device = loopback_device
+        self.loopback_fps = loopback_fps
         self.tcp_server: Optional[socket.socket] = None
         self.client_socket: Optional[socket.socket] = None
         self.video_sender: Optional[SimpleH264Sender] = None
@@ -785,11 +792,14 @@ class XRoboCompatServer:
                     f"{params.get('fps', 60)}fps, {params.get('bitrate', 8000000)//1000000}Mbps")
 
         # 创建视频发送器
+        # 传递 V4L2 Loopback 配置用于双进程架构
         config = VideoConfig(
             width=params.get('width', 2560),
             height=params.get('height', 720),
             fps=params.get('fps', 60),
-            bitrate=params.get('bitrate', 8000000)
+            bitrate=params.get('bitrate', 8000000),
+            loopback_device=self.loopback_device,
+            loopback_fps=self.loopback_fps
         )
 
         try:

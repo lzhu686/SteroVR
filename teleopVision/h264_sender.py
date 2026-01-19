@@ -80,6 +80,10 @@ class VideoConfig:
     bitrate: int = 20971520      # 20 Mbps (20 * 1024 * 1024)
     keyframe_interval: int = 1   # GOP=1
 
+    # V4L2 Loopback 双进程架构配置
+    loopback_device: Optional[str] = None  # V4L2 Loopback 设备路径 (如 /dev/stereo_camera)
+    loopback_fps: int = 30                  # Loopback 输出帧率 (ROS2 发布用)
+
     @property
     def single_eye_width(self) -> int:
         """单眼宽度"""
@@ -505,7 +509,40 @@ class SimpleH264Sender:
                 '-i', self.device_path,  # 使用设备路径 (如 /dev/video13)
             ]
 
+        # ============== 构建 FFmpeg 命令 ==============
+        # 基础命令: 输入参数 + 编码器参数 + H.264 输出到 stdout
         ffmpeg_cmd = ['ffmpeg', '-y'] + input_args + encoder_args + ['-f', 'h264', '-']
+
+        # V4L2 Loopback 双输出模式 (仅 Linux)
+        # 架构:
+        # Camera → FFmpeg → [H.264 → stdout → PICO (60fps)]
+        #                 → [MJPEG → /dev/stereo_camera (30fps) → ROS2独立进程]
+        if self.config.loopback_device and sys.platform != 'win32':
+            loopback_fps = self.config.loopback_fps
+            loopback_device = self.config.loopback_device
+
+            logger.info(f"启用 V4L2 Loopback 双输出模式")
+            logger.info(f"  主输出: H.264 → TCP → PICO ({actual_fps}fps)")
+            logger.info(f"  副输出: MJPEG → {loopback_device} ({loopback_fps}fps)")
+
+            # 重新构建命令，使用 tee 分发多输出
+            # FFmpeg 多输出语法: -map 0:v 指定输入流，多个输出分别配置
+            ffmpeg_cmd = [
+                'ffmpeg', '-y'
+            ] + input_args + [
+                # 输出 1: H.264 到 stdout (PICO 高优先级)
+                '-map', '0:v',
+            ] + encoder_args + [
+                '-f', 'h264', 'pipe:1',
+
+                # 输出 2: MJPEG 到 V4L2 Loopback (ROS2 发布)
+                '-map', '0:v',
+                '-r', str(loopback_fps),       # 降帧率
+                '-c:v', 'mjpeg',               # MJPEG 编码 (ROS2 易处理)
+                '-q:v', '3',                   # MJPEG 质量 (1-31, 越小越好)
+                '-f', 'v4l2',
+                loopback_device
+            ]
 
         try:
             logger.info(f"FFmpeg 命令: {' '.join(ffmpeg_cmd)}")

@@ -21,14 +21,15 @@ StereoVR 是一个 USB 双目相机流媒体库，支持将双目视频实时传
 
 ### 支持的传输模式
 
-| 特性 | WebSocket 模式 | XRoboToolkit 模式 |
-|------|----------------|-------------------|
-| 协议 | WSS (Base64 JPEG) | TCP H.264 (NVENC) |
-| 延迟 | ~80-150ms | **~30-50ms** |
-| 客户端 | 任意 WebXR 浏览器 | XRoboToolkit Unity |
-| 设备支持 | Quest/PICO/Vision Pro | PICO |
-| 适用场景 | 演示/调试 | **遥操作(推荐)** |
-| 连接方式 | WiFi | USB ADB / WiFi |
+| 特性 | WebSocket 模式 | XRoboToolkit 模式 | V4L2 Loopback 模式 |
+|------|----------------|-------------------|-------------------|
+| 协议 | WSS (Base64 JPEG) | TCP H.264 (NVENC) | MJPEG → V4L2 |
+| 延迟 | ~80-150ms | **~30-50ms** | ~40-60ms |
+| 客户端 | 任意 WebXR 浏览器 | XRoboToolkit Unity | ROS2 / OpenCV |
+| 设备支持 | Quest/PICO/Vision Pro | PICO | 任意 Linux 应用 |
+| 适用场景 | 演示/调试 | **遥操作(推荐)** | **ROS2 机器人感知** |
+| 连接方式 | WiFi | USB ADB / WiFi | USB 有线 |
+| ROS2 集成 | 否 | 否 | **是** |
 
 ---
 
@@ -62,6 +63,94 @@ python start_xrobo_compat.py
 1. 选择视频源 `USB_STEREO`
 2. 输入 PC IP 地址
 3. 点击 Listen
+
+### 方式三: V4L2 Loopback 双进程架构 (ROS2 发布)
+
+V4L2 (Video4Linux2) 是 Linux 的视频设备标准 API。通过 V4L2 Loopback，可以创建一个虚拟相机设备，将视频流输出到其他应用程序。
+
+**架构优势:**
+- 进程隔离: ROS2 发布完全独立，不影响 PICO 视频流延迟
+- 资源独立: 各自有独立的 CPU/GPU 资源分配
+- 故障隔离: ROS2 进程崩溃不影响 PICO 实时视频流
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  进程 1: PICO 视频流 (高优先级)                                           │
+│  /dev/stereo_camera → FFmpeg → H.264 → TCP → PICO (60fps)            │
+│              ↓                                                           │
+│         MJPEG → /dev/video99 (30fps)                                   │
+└──────────────────────────────────────────────────────────────────────────┘
+                            │
+                  V4L2 Loopback
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  进程 2: ROS2 发布 (独立进程)                                             │
+│  /dev/video99 → OpenCV → 左右分割 → CompressedImage                     │
+│                                    ├─ /stereo/left/compressed           │
+│                                    └─ /stereo/right/compressed          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**启动步骤:**
+
+```bash
+# 1. 加载 v4l2loopback 模块 (需要 root 权限)
+sudo modprobe v4l2loopback video_nr=99 card_label="StereoVR_ROS2"
+
+# 2. 启动主服务器 (输出到 loopback 设备)
+python start_xrobo_compat.py --device /dev/stereo_camera --loopback /dev/video99 --loopback-fps 30
+
+# 3. 在另一个终端启动 ROS2 发布
+python -m teleopVision.ros2_loopback_publisher --device /dev/video99 --fps 30
+
+# 4. 验证 ROS2 话题
+ros2 topic list | grep stereo
+ros2 topic hz /stereo/left/compressed
+```
+
+**使用 UDEV 规则固定设备名称:**
+
+双目相机设备信息:
+- **Vendor ID:** `1bcf` (Sunplus Innovation Technology)
+- **Product ID:** `2d4f`
+- **设备名称:** USB2.0 Camera
+
+为避免设备编号变化，创建 `/etc/udev/rules.d/99-stereo-camera.rules`:
+
+```bash
+# 创建 udev 规则文件
+sudo tee /etc/udev/rules.d/99-stereo-camera.rules << 'EOF'
+# USB2.0 Camera RGB (双目相机) - 固定为 /dev/stereo_camera
+# Vendor: 1bcf (Sunplus), Product: 2d4f
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1bcf", ATTRS{idProduct}=="2d4f", ATTR{index}=="0", SYMLINK+="stereo_camera", MODE="0666"
+EOF
+
+# 重新加载 udev 规则
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+# 验证设备链接
+ls -la /dev/stereo_camera
+readlink -f /dev/stereo_camera
+```
+
+现在可以使用固定的设备路径:
+
+```bash
+# 启动主服务器 (使用固定的符号链接)
+python start_xrobo_compat.py --device /dev/stereo_camera --loopback /dev/video99 --loopback-fps 30
+
+# 重置相机参数 (可选)
+v4l2-ctl -d /dev/stereo_camera --set-ctrl=brightness=0,contrast=3,auto_exposure=3
+```
+
+**ROS2 话题:**
+
+| 话题 | 类型 | 帧率 | 说明 |
+|------|------|------|------|
+| `/stereo/left/compressed` | CompressedImage | 30fps | 左眼图像 (JPEG) |
+| `/stereo/right/compressed` | CompressedImage | 30fps | 右眼图像 (JPEG) |
 
 ---
 
@@ -219,7 +308,8 @@ StereoVR/
 │   ├── camera.py                  # 相机采集模块
 │   ├── server.py                  # WebSocket 服务器
 │   ├── h264_sender.py             # H.264 编码器 (FFmpeg)
-│   └── xrobo_compat_server.py     # XRoboToolkit 兼容服务器
+│   ├── xrobo_compat_server.py     # XRoboToolkit 兼容服务器
+│   └── ros2_loopback_publisher.py # V4L2 Loopback ROS2 发布器
 │
 ├── 🌐 web/                        # Web 前端
 │   ├── index.html                 # 主页
@@ -233,7 +323,7 @@ StereoVR/
 │   └── UNIFIED_TELEOP_SYSTEM.md   # 统一遥操作系统
 │
 ├── 🚀 start.py                    # WebSocket 模式启动
-├── 🚀 start_xrobo_compat.py       # XRoboToolkit 模式启动
+├── 🚀 start_xrobo_compat.py       # XRoboToolkit 模式启动 (支持 V4L2 Loopback)
 └── README.md                      # 项目说明
 ```
 
