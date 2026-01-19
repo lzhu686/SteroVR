@@ -1112,12 +1112,17 @@ class LoopbackCapturer:
         """检查是否正在采集"""
         return self.is_running and self.ffmpeg_process is not None
 
-    def get_h264_output(self) -> Optional[subprocess.Popen]:
+    def get_h264_output(self, bitrate: Optional[int] = None, fps: Optional[int] = None) -> Optional[subprocess.Popen]:
         """
         获取 H.264 输出进程
 
         切换到双输出模式，返回可读取 H.264 数据的 FFmpeg 进程
         调用者负责从 process.stdout 读取 H.264 数据
+
+        参数:
+            bitrate: H.264 编码码率 (bps)，如 8000000 表示 8Mbps
+                     如果不指定，使用初始化时的默认值
+            fps: H.264 输出帧率，如果不指定，使用相机实际帧率
 
         返回:
             FFmpeg 进程 (stdout 为 H.264 流)，失败返回 None
@@ -1130,6 +1135,17 @@ class LoopbackCapturer:
             if self._h264_enabled:
                 logger.warning("[LoopbackCapturer] H.264 输出已启用")
                 return self.ffmpeg_process
+
+            # 更新配置参数 (如果提供了新值)
+            if bitrate is not None:
+                old_bitrate = self.config.bitrate
+                self.config.bitrate = bitrate
+                logger.info(f"[LoopbackCapturer] 更新码率: {old_bitrate//1000}kbps -> {bitrate//1000}kbps")
+
+            if fps is not None:
+                old_fps = self.config.fps
+                self.config.fps = fps
+                logger.info(f"[LoopbackCapturer] 更新帧率: {old_fps}fps -> {fps}fps")
 
             # 停止当前进程
             if self.ffmpeg_process:
@@ -1188,7 +1204,7 @@ class LoopbackCapturer:
 
         try:
             logger.info(f"[LoopbackCapturer] 启动 FFmpeg (DUAL_OUTPUT 模式)")
-            logger.info(f"[LoopbackCapturer] 主输出: H.264 → stdout ({actual_fps}fps)")
+            logger.info(f"[LoopbackCapturer] 主输出: H.264 → stdout ({actual_fps}fps, {bitrate_k}kbps)")
             logger.info(f"[LoopbackCapturer] 副输出: MJPEG → {loopback_device} ({loopback_fps}fps)")
 
             self.ffmpeg_process = subprocess.Popen(

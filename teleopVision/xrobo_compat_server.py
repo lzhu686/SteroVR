@@ -499,7 +499,7 @@ class XRoboCompatServer:
             width=2560,
             height=720,
             fps=60,
-            bitrate=8000000,
+            bitrate=30000000,  # 30 Mbps
             loopback_device=self.loopback_device,
             loopback_fps=self.loopback_fps
         )
@@ -922,8 +922,14 @@ class XRoboCompatServer:
                 return
 
             # 2. 切换 LoopbackCapturer 到双输出模式
-            logger.info("切换 LoopbackCapturer 到双输出模式...")
-            ffmpeg_process = self.loopback_capturer.get_h264_output()
+            # 传递 PICO 请求的参数 (码率、帧率)
+            requested_bitrate = params.get('bitrate', 30000000)  # 默认 30Mbps
+            requested_fps = params.get('fps', 60)
+            logger.info(f"切换 LoopbackCapturer 到双输出模式 (码率: {requested_bitrate//1000}kbps, 帧率: {requested_fps}fps)...")
+            ffmpeg_process = self.loopback_capturer.get_h264_output(
+                bitrate=requested_bitrate,
+                fps=requested_fps
+            )
 
             if not ffmpeg_process:
                 logger.error("无法获取 H.264 输出")
