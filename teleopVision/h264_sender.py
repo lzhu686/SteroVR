@@ -979,15 +979,23 @@ class LoopbackCapturer:
 
         logger.info(f"[LoopbackCapturer] 设备路径: {self.device_path}, 设备ID: {self.device_id}")
 
-        # 用 OpenCV 测试相机 (直接使用设备路径)
-        test_cap = cv2.VideoCapture(self.device_path)
+        # 用 OpenCV 测试相机 (使用 V4L2 后端 + 设备路径)
+        test_cap = cv2.VideoCapture(self.device_path, cv2.CAP_V4L2)
         test_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
         test_cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
         test_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
         test_cap.set(cv2.CAP_PROP_FPS, self.config.fps)
 
         if not test_cap.isOpened():
-            logger.error(f"[LoopbackCapturer] 无法打开相机: {device}")
+            logger.error(f"[LoopbackCapturer] 无法打开相机: {self.device_path}")
+            # 尝试检查设备权限
+            import stat
+            try:
+                st = os.stat(self.device_path)
+                mode = stat.filemode(st.st_mode)
+                logger.error(f"[LoopbackCapturer] 设备权限: {mode}, 请确保用户在 video 组")
+            except Exception as e:
+                logger.error(f"[LoopbackCapturer] 无法获取设备信息: {e}")
             return False
 
         actual_w = int(test_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
