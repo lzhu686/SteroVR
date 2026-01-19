@@ -955,16 +955,32 @@ class LoopbackCapturer:
         """
         初始化相机 (与 SimpleH264Sender.initialize 相同逻辑)
         """
+        import os
+        import re
+
+        logger.info(f"[LoopbackCapturer] 初始化相机: {device}")
+
         # 解析设备标识
         if isinstance(device, str):
             if sys.platform == 'win32':
                 self.device_path = device if device.startswith('video=') else f"video={device}"
                 self.device_id = 0
             else:
-                self.device_path = device
-                import re
-                match = re.search(r'/dev/video(\d+)', device)
-                self.device_id = int(match.group(1)) if match else 0
+                # Linux: 先解析符号链接获取实际设备路径
+                if os.path.islink(device):
+                    real_path = os.path.realpath(device)
+                    logger.info(f"[LoopbackCapturer] 符号链接 {device} -> {real_path}")
+                    self.device_path = real_path
+                else:
+                    self.device_path = device
+
+                # 从实际路径提取设备号
+                match = re.search(r'/dev/video(\d+)', self.device_path)
+                if match:
+                    self.device_id = int(match.group(1))
+                else:
+                    logger.warning(f"[LoopbackCapturer] 无法从路径提取设备号: {self.device_path}，使用路径直接打开")
+                    self.device_id = self.device_path  # OpenCV 也支持字符串路径
         else:
             self.device_id = device
             if sys.platform == 'win32':
@@ -972,7 +988,7 @@ class LoopbackCapturer:
             else:
                 self.device_path = f"/dev/video{device}"
 
-        logger.info(f"[LoopbackCapturer] 初始化相机: {device}")
+        logger.info(f"[LoopbackCapturer] 设备路径: {self.device_path}, 设备ID: {self.device_id}")
 
         # 用 OpenCV 测试相机
         test_cap = cv2.VideoCapture(self.device_id)
@@ -991,14 +1007,6 @@ class LoopbackCapturer:
         logger.info(f"[LoopbackCapturer] 相机配置: {actual_w}x{actual_h} @ {self.actual_fps:.1f}fps")
 
         test_cap.release()
-
-        # Linux: 如果传入符号链接，解析实际路径
-        if sys.platform != 'win32' and isinstance(device, str):
-            import os
-            if os.path.islink(device):
-                real_path = os.path.realpath(device)
-                logger.info(f"[LoopbackCapturer] 符号链接 {device} -> {real_path}")
-                self.device_path = real_path
 
         return True
 
