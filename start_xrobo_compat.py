@@ -317,8 +317,10 @@ UDEV 规则设置 (创建固定设备链接):
     print("Starting server...")
     print()
 
+    server = None
     try:
         from teleopVision.xrobo_compat_server import XRoboCompatServer
+        import signal
 
         # 创建服务器配置
         # 注意: XRoboCompatServer 只接受 device_id 和 loopback 参数
@@ -345,10 +347,21 @@ UDEV 规则设置 (创建固定设备链接):
             print()
 
         server = XRoboCompatServer(**server_config)
+
+        # 设置信号处理，确保资源正确释放
+        def signal_handler(sig, frame):
+            print(f"\n\n👋 收到中断信号 ({sig})，正在停止...")
+            if server:
+                server.stop()
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
         server.start()
     except KeyboardInterrupt:
         print("\n\n👋 收到中断信号，正在停止...")
-        if 'server' in dir():
+        if server:
             server.stop()
     except Exception as e:
         print(f"\n❌ 服务器错误: {e}")

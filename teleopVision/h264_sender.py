@@ -1090,17 +1090,29 @@ class LoopbackCapturer:
                     logger.debug(f"[FFmpeg] {text}")
 
     def stop(self):
-        """停止采集"""
+        """停止采集，确保资源释放"""
         logger.info("[LoopbackCapturer] 停止采集...")
         self.is_running = False
 
         if self.ffmpeg_process:
-            self.ffmpeg_process.terminate()
             try:
-                self.ffmpeg_process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.ffmpeg_process.kill()
-            self.ffmpeg_process = None
+                self.ffmpeg_process.terminate()
+                try:
+                    self.ffmpeg_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    logger.warning("[LoopbackCapturer] FFmpeg 未响应 terminate，强制 kill...")
+                    self.ffmpeg_process.kill()
+                    self.ffmpeg_process.wait(timeout=1)
+            except Exception as e:
+                logger.warning(f"[LoopbackCapturer] 停止 FFmpeg 时出错: {e}")
+                # 最后尝试用系统命令杀死
+                try:
+                    import os
+                    os.system("pkill -9 -f 'ffmpeg.*v4l2'")
+                except:
+                    pass
+            finally:
+                self.ffmpeg_process = None
 
         elapsed = time.time() - self.stats['start_time'] if self.stats['start_time'] > 0 else 0
         logger.info(f"[LoopbackCapturer] 采集已停止，运行时长: {elapsed:.1f}秒")
