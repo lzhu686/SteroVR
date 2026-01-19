@@ -272,6 +272,9 @@ class ROS2LoopbackPublisher:
                 msg_right.data = right_jpeg.tobytes()
                 self.pub_right.publish(msg_right)
 
+                # 处理 ROS2 回调 (必须调用以确保消息发送)
+                rclpy.spin_once(self.node, timeout_sec=0)
+
                 frame_count += 1
                 self.stats['frames_published'] = frame_count
 
