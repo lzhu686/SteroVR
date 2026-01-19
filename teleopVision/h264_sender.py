@@ -974,13 +974,12 @@ class LoopbackCapturer:
                 else:
                     self.device_path = device
 
-                # 从实际路径提取设备号
+                # 从实际路径提取设备号 (仅用于日志)
                 match = re.search(r'/dev/video(\d+)', self.device_path)
                 if match:
                     self.device_id = int(match.group(1))
                 else:
-                    logger.warning(f"[LoopbackCapturer] 无法从路径提取设备号: {self.device_path}，使用路径直接打开")
-                    self.device_id = self.device_path  # OpenCV 也支持字符串路径
+                    self.device_id = -1
         else:
             self.device_id = device
             if sys.platform == 'win32':
@@ -991,7 +990,11 @@ class LoopbackCapturer:
         logger.info(f"[LoopbackCapturer] 设备路径: {self.device_path}, 设备ID: {self.device_id}")
 
         # 用 OpenCV 测试相机
-        test_cap = cv2.VideoCapture(self.device_id)
+        # Linux: 直接使用设备路径字符串打开，不要用索引号
+        if sys.platform != 'win32' and self.device_path:
+            test_cap = cv2.VideoCapture(self.device_path)
+        else:
+            test_cap = cv2.VideoCapture(self.device_id)
         test_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
         test_cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
         test_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
