@@ -904,5 +904,367 @@ def test_simple_sender():
     print("测试完成")
 
 
+# ============== Loopback 独立采集器 ==============
+
+class LoopbackCapturer:
+    """
+    V4L2 Loopback 独立采集器
+
+    方案 B 的核心组件：启动即采集，不依赖 PICO 连接
+
+    架构说明:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  LoopbackCapturer (启动即运行)                                   │
+    │  /dev/stereo_camera → FFmpeg → MJPEG → /dev/video99            │
+    │                                                                  │
+    │  模式切换:                                                       │
+    │  - LOOPBACK_ONLY: 仅输出到 loopback (ROS2 用)                   │
+    │  - DUAL_OUTPUT: 同时输出到 loopback + H.264 stdout (PICO 用)    │
+    └─────────────────────────────────────────────────────────────────┘
+
+    使用方法:
+        capturer = LoopbackCapturer(config)
+        capturer.start()  # 立即开始采集，输出到 loopback
+
+        # PICO 连接时切换到双输出模式
+        capturer.enable_h264_output()  # 返回可读取 H.264 的 stdout
+
+        # PICO 断开时回退
+        capturer.disable_h264_output()
+    """
+
+    def __init__(self, config: VideoConfig):
+        self.config = config
+        self.ffmpeg_process: Optional[subprocess.Popen] = None
+        self.is_running = False
+        self.device_id = 0
+        self.device_path = ""
+        self.actual_fps = 30.0
+
+        # 模式状态
+        self._h264_enabled = False
+        self._mode_lock = threading.RLock()
+
+        # 统计
+        self.stats = {
+            'start_time': 0.0,
+            'frames_captured': 0,
+        }
+
+    def initialize(self, device: int | str = 0) -> bool:
+        """
+        初始化相机 (与 SimpleH264Sender.initialize 相同逻辑)
+        """
+        # 解析设备标识
+        if isinstance(device, str):
+            if sys.platform == 'win32':
+                self.device_path = device if device.startswith('video=') else f"video={device}"
+                self.device_id = 0
+            else:
+                self.device_path = device
+                import re
+                match = re.search(r'/dev/video(\d+)', device)
+                self.device_id = int(match.group(1)) if match else 0
+        else:
+            self.device_id = device
+            if sys.platform == 'win32':
+                self.device_path = ""
+            else:
+                self.device_path = f"/dev/video{device}"
+
+        logger.info(f"[LoopbackCapturer] 初始化相机: {device}")
+
+        # 用 OpenCV 测试相机
+        test_cap = cv2.VideoCapture(self.device_id)
+        test_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        test_cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
+        test_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
+        test_cap.set(cv2.CAP_PROP_FPS, self.config.fps)
+
+        if not test_cap.isOpened():
+            logger.error(f"[LoopbackCapturer] 无法打开相机: {device}")
+            return False
+
+        actual_w = int(test_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(test_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.actual_fps = test_cap.get(cv2.CAP_PROP_FPS)
+        logger.info(f"[LoopbackCapturer] 相机配置: {actual_w}x{actual_h} @ {self.actual_fps:.1f}fps")
+
+        test_cap.release()
+
+        # Linux: 如果传入符号链接，解析实际路径
+        if sys.platform != 'win32' and isinstance(device, str):
+            import os
+            if os.path.islink(device):
+                real_path = os.path.realpath(device)
+                logger.info(f"[LoopbackCapturer] 符号链接 {device} -> {real_path}")
+                self.device_path = real_path
+
+        return True
+
+    def start(self) -> bool:
+        """
+        启动采集 (仅 loopback 输出模式)
+
+        立即开始采集，ROS2 发布进程可以立即获取数据
+        """
+        if self.is_running:
+            logger.warning("[LoopbackCapturer] 已在运行中")
+            return True
+
+        if not self.config.loopback_device:
+            logger.error("[LoopbackCapturer] 未配置 loopback_device")
+            return False
+
+        if sys.platform == 'win32':
+            logger.warning("[LoopbackCapturer] Windows 不支持 V4L2 Loopback")
+            return False
+
+        return self._start_ffmpeg_loopback_only()
+
+    def _start_ffmpeg_loopback_only(self) -> bool:
+        """启动 FFmpeg (仅 loopback 输出)"""
+        loopback_device = self.config.loopback_device
+        loopback_fps = self.config.loopback_fps
+        actual_fps = int(self.actual_fps)
+
+        input_args = [
+            '-f', 'v4l2',
+            '-input_format', 'mjpeg',
+            '-video_size', f'{self.config.width}x{self.config.height}',
+            '-framerate', str(actual_fps),
+            '-i', self.device_path,
+        ]
+
+        # 仅输出到 loopback
+        ffmpeg_cmd = [
+            'ffmpeg', '-y'
+        ] + input_args + [
+            '-r', str(loopback_fps),
+            '-c:v', 'mjpeg',
+            '-q:v', '3',
+            '-f', 'v4l2',
+            loopback_device
+        ]
+
+        try:
+            logger.info(f"[LoopbackCapturer] 启动 FFmpeg (LOOPBACK_ONLY 模式)")
+            logger.info(f"[LoopbackCapturer] 输出: {loopback_device} @ {loopback_fps}fps")
+            logger.info(f"[LoopbackCapturer] 命令: {' '.join(ffmpeg_cmd)}")
+
+            self.ffmpeg_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE
+            )
+
+            self.is_running = True
+            self._h264_enabled = False
+            self.stats['start_time'] = time.time()
+
+            # 后台线程监控 FFmpeg
+            threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
+
+            logger.info(f"[LoopbackCapturer] ✓ 采集已启动，ROS2 可以立即读取 {loopback_device}")
+            return True
+
+        except Exception as e:
+            logger.error(f"[LoopbackCapturer] 启动 FFmpeg 失败: {e}")
+            return False
+
+    def _monitor_ffmpeg(self):
+        """监控 FFmpeg 进程"""
+        if self.ffmpeg_process and self.ffmpeg_process.stderr:
+            for line in self.ffmpeg_process.stderr:
+                text = line.decode('utf-8', errors='ignore').strip()
+                if text:
+                    # 过滤常见的非错误信息
+                    if 'frame=' in text or 'fps=' in text:
+                        continue  # 进度信息，不打印
+                    logger.debug(f"[FFmpeg] {text}")
+
+    def stop(self):
+        """停止采集"""
+        logger.info("[LoopbackCapturer] 停止采集...")
+        self.is_running = False
+
+        if self.ffmpeg_process:
+            self.ffmpeg_process.terminate()
+            try:
+                self.ffmpeg_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.ffmpeg_process.kill()
+            self.ffmpeg_process = None
+
+        elapsed = time.time() - self.stats['start_time'] if self.stats['start_time'] > 0 else 0
+        logger.info(f"[LoopbackCapturer] 采集已停止，运行时长: {elapsed:.1f}秒")
+
+    def is_capturing(self) -> bool:
+        """检查是否正在采集"""
+        return self.is_running and self.ffmpeg_process is not None
+
+    def get_h264_output(self) -> Optional[subprocess.Popen]:
+        """
+        获取 H.264 输出进程
+
+        切换到双输出模式，返回可读取 H.264 数据的 FFmpeg 进程
+        调用者负责从 process.stdout 读取 H.264 数据
+
+        返回:
+            FFmpeg 进程 (stdout 为 H.264 流)，失败返回 None
+        """
+        with self._mode_lock:
+            if not self.is_running:
+                logger.error("[LoopbackCapturer] 未运行，无法启用 H.264 输出")
+                return None
+
+            if self._h264_enabled:
+                logger.warning("[LoopbackCapturer] H.264 输出已启用")
+                return self.ffmpeg_process
+
+            # 停止当前进程
+            if self.ffmpeg_process:
+                logger.info("[LoopbackCapturer] 切换到 DUAL_OUTPUT 模式...")
+                self.ffmpeg_process.terminate()
+                try:
+                    self.ffmpeg_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.ffmpeg_process.kill()
+
+            # 启动双输出进程
+            if self._start_ffmpeg_dual_output():
+                self._h264_enabled = True
+                return self.ffmpeg_process
+            else:
+                # 回退到 loopback only
+                self._start_ffmpeg_loopback_only()
+                return None
+
+    def _start_ffmpeg_dual_output(self) -> bool:
+        """启动 FFmpeg (双输出模式)"""
+        loopback_device = self.config.loopback_device
+        loopback_fps = self.config.loopback_fps
+        actual_fps = int(self.actual_fps)
+        bitrate_k = self.config.bitrate_kbps
+
+        # 检测 NVENC
+        use_nvenc = self._check_nvenc_available()
+        encoder_args = self._get_encoder_args(bitrate_k, use_nvenc)
+
+        input_args = [
+            '-f', 'v4l2',
+            '-input_format', 'mjpeg',
+            '-video_size', f'{self.config.width}x{self.config.height}',
+            '-framerate', str(actual_fps),
+            '-i', self.device_path,
+        ]
+
+        # 双输出命令
+        ffmpeg_cmd = [
+            'ffmpeg', '-y'
+        ] + input_args + [
+            # 输出 1: H.264 到 stdout (PICO)
+            '-map', '0:v',
+        ] + encoder_args + [
+            '-f', 'h264', 'pipe:1',
+
+            # 输出 2: MJPEG 到 loopback (ROS2)
+            '-map', '0:v',
+            '-r', str(loopback_fps),
+            '-c:v', 'mjpeg',
+            '-q:v', '3',
+            '-f', 'v4l2',
+            loopback_device
+        ]
+
+        try:
+            logger.info(f"[LoopbackCapturer] 启动 FFmpeg (DUAL_OUTPUT 模式)")
+            logger.info(f"[LoopbackCapturer] 主输出: H.264 → stdout ({actual_fps}fps)")
+            logger.info(f"[LoopbackCapturer] 副输出: MJPEG → {loopback_device} ({loopback_fps}fps)")
+
+            self.ffmpeg_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            # 后台读取 stderr
+            threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
+            return True
+
+        except Exception as e:
+            logger.error(f"[LoopbackCapturer] 启动双输出 FFmpeg 失败: {e}")
+            return False
+
+    def release_h264_output(self):
+        """
+        释放 H.264 输出，回退到仅 loopback 模式
+
+        PICO 断开连接时调用
+        """
+        with self._mode_lock:
+            if not self._h264_enabled:
+                return
+
+            logger.info("[LoopbackCapturer] 切换回 LOOPBACK_ONLY 模式...")
+
+            if self.ffmpeg_process:
+                self.ffmpeg_process.terminate()
+                try:
+                    self.ffmpeg_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.ffmpeg_process.kill()
+
+            self._h264_enabled = False
+            self._start_ffmpeg_loopback_only()
+
+    def _check_nvenc_available(self) -> bool:
+        """检测 NVENC"""
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-hide_banner', '-encoders'],
+                capture_output=True, text=True, timeout=5
+            )
+            return 'h264_nvenc' in result.stdout
+        except:
+            return False
+
+    def _get_encoder_args(self, bitrate_k: int, use_nvenc: bool) -> list:
+        """获取编码器参数"""
+        if use_nvenc:
+            return [
+                '-pix_fmt', 'yuv420p',
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p1',
+                '-tune', 'll',
+                '-profile:v', 'baseline',
+                '-level', '4.2',
+                '-rc', 'cbr',
+                '-b:v', f'{bitrate_k}k',
+                '-maxrate', f'{bitrate_k}k',
+                '-bufsize', f'{bitrate_k // 20}k',
+                '-g', '1',
+                '-keyint_min', '1',
+                '-delay', '0',
+                '-zerolatency', '1',
+            ]
+        else:
+            return [
+                '-pix_fmt', 'yuv420p',
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-profile:v', 'baseline',
+                '-level', '4.2',
+                '-b:v', f'{bitrate_k}k',
+                '-maxrate', f'{bitrate_k}k',
+                '-bufsize', f'{bitrate_k // 20}k',
+                '-g', '1',
+                '-keyint_min', '1',
+            ]
+
+
 if __name__ == '__main__':
     test_simple_sender()

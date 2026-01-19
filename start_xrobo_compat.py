@@ -327,22 +327,29 @@ UDEV 规则设置 (创建固定设备链接):
             'device_id': selected_device,
         }
 
-        # 添加 loopback 配置 (V4L2 Loopback 双进程架构)
+        # 添加 loopback 配置 (方案 B: 启动即采集)
         if args.loopback:
             server_config['loopback_device'] = args.loopback
             server_config['loopback_fps'] = args.loopback_fps
-            print(f"🔄 V4L2 Loopback 双进程架构已启用:")
-            print(f"   Loopback 设备: {args.loopback}")
-            print(f"   Loopback 帧率: {args.loopback_fps} fps")
-            print(f"   数据流向:")
-            print(f"     Camera → FFmpeg → H.264 → PICO ({args.fps}fps)")
-            print(f"                     → MJPEG → {args.loopback} ({args.loopback_fps}fps)")
+            print(f"🔄 方案 B: 启动即采集 (V4L2 Loopback 双进程架构)")
+            print(f"   ┌─────────────────────────────────────────────────────────────┐")
+            print(f"   │ 启动时: Camera → FFmpeg → MJPEG → {args.loopback} ({args.loopback_fps}fps)  │")
+            print(f"   │         ROS2 发布进程可以立即读取数据                        │")
+            print(f"   ├─────────────────────────────────────────────────────────────┤")
+            print(f"   │ PICO连接: 切换双输出模式                                     │")
+            print(f"   │         Camera → FFmpeg → H.264 → PICO ({args.fps}fps)        │")
+            print(f"   │                         → MJPEG → {args.loopback} ({args.loopback_fps}fps)    │")
+            print(f"   ├─────────────────────────────────────────────────────────────┤")
+            print(f"   │ PICO断开: 回退仅 loopback 模式 (ROS2 不受影响)               │")
+            print(f"   └─────────────────────────────────────────────────────────────┘")
             print()
 
         server = XRoboCompatServer(**server_config)
         server.start()
     except KeyboardInterrupt:
         print("\n\n👋 收到中断信号，正在停止...")
+        if 'server' in dir():
+            server.stop()
     except Exception as e:
         print(f"\n❌ 服务器错误: {e}")
         import traceback

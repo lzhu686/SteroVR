@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 # 导入 H.264 发送器
-from .h264_sender import SimpleH264Sender, VideoConfig
+from .h264_sender import SimpleH264Sender, VideoConfig, LoopbackCapturer
 
 # 配置日志
 logging.basicConfig(
@@ -387,9 +387,14 @@ class XRoboCompatServer:
             device_id: 相机设备标识，支持:
                 - int: 设备索引 (0, 1, 2...)
                 - str: 设备路径 (Linux: "/dev/video0", Windows: "video=Name")
-            loopback_device: V4L2 Loopback 设备路径 (如 /dev/stereo_camera)
+            loopback_device: V4L2 Loopback 设备路径 (如 /dev/video99)
                              用于向独立的 ROS2 发布进程输出视频
             loopback_fps: Loopback 输出帧率 (默认 30fps)
+
+        方案 B 架构:
+            启动即采集 → loopback 始终有数据 (ROS2 可用)
+            PICO 连接 → 切换双输出模式
+            PICO 断开 → 回退仅 loopback 模式
         """
         self.device_id = device_id
         self.loopback_device = loopback_device
@@ -400,6 +405,9 @@ class XRoboCompatServer:
         self.is_running = False
         self.client_thread: Optional[threading.Thread] = None
         self.adb_connected = False
+
+        # 方案 B: Loopback 独立采集器 (启动即运行)
+        self.loopback_capturer: Optional[LoopbackCapturer] = None
 
         # 线程安全: 状态锁
         self._state_lock = threading.RLock()
@@ -475,6 +483,45 @@ class XRoboCompatServer:
             logger.warning(f"ADB reverse 异常: {e}")
             return False
 
+    def _start_loopback_capturer(self) -> bool:
+        """
+        启动 Loopback 采集器 (方案 B)
+
+        立即开始采集，ROS2 发布进程可以立即获取数据
+        不需要等待 PICO 连接
+        """
+        logger.info("=" * 60)
+        logger.info("启动 Loopback 采集器 (方案 B: 启动即采集)")
+        logger.info("=" * 60)
+
+        config = VideoConfig(
+            width=2560,
+            height=720,
+            fps=60,
+            bitrate=8000000,
+            loopback_device=self.loopback_device,
+            loopback_fps=self.loopback_fps
+        )
+
+        self.loopback_capturer = LoopbackCapturer(config)
+
+        if not self.loopback_capturer.initialize(self.device_id):
+            logger.error("Loopback 采集器初始化失败")
+            self.loopback_capturer = None
+            return False
+
+        if not self.loopback_capturer.start():
+            logger.error("Loopback 采集器启动失败")
+            self.loopback_capturer = None
+            return False
+
+        logger.info(f"✓ Loopback 采集已启动")
+        logger.info(f"  输出设备: {self.loopback_device}")
+        logger.info(f"  输出帧率: {self.loopback_fps}fps")
+        logger.info(f"  ROS2 发布进程可以立即读取数据")
+        logger.info("=" * 60)
+        return True
+
     def start(self) -> bool:
         """启动服务器"""
         try:
@@ -485,6 +532,12 @@ class XRoboCompatServer:
                 self._setup_adb_reverse(ProtocolConstants.TCP_PORT)
             else:
                 logger.info("未检测到 ADB 连接，将使用 WiFi IP 进行视频传输")
+
+            # ============== 方案 B: 启动即采集 ==============
+            # 如果配置了 loopback，立即启动采集
+            # ROS2 发布进程可以立即获取数据，不需要等待 PICO 连接
+            if self.loopback_device and sys.platform != 'win32':
+                self._start_loopback_capturer()
 
             # 创建 TCP 服务器
             self.tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -499,6 +552,8 @@ class XRoboCompatServer:
             logger.info("=" * 60)
             logger.info(f"TCP 监听端口: {ProtocolConstants.TCP_PORT}")
             logger.info(f"相机设备: {self.device_id}")
+            if self.loopback_capturer and self.loopback_capturer.is_capturing():
+                logger.info(f"Loopback 输出: {self.loopback_device} @ {self.loopback_fps}fps (ROS2 可用)")
             logger.info("")
             logger.info("等待 PICO 头显连接...")
             logger.info("请在 Unity Client 中:")
@@ -783,16 +838,20 @@ class XRoboCompatServer:
             target_ip = "127.0.0.1"
             self._setup_adb_forward(target_port)
 
-        # 方案 A: Unity 端已通过 MEDIA_DECODER_READY 通知就绪，无需探测
-        # 如果是旧协议 (StartReceivePcCamera)，仍使用方案 B 探测
-        # 这里假设调用者已确保 MediaDecoder 就绪
-
         logger.info(f"启动视频流: {target_ip}:{target_port}")
         logger.info(f"参数: {params.get('width', 2560)}x{params.get('height', 720)} @ "
                     f"{params.get('fps', 60)}fps, {params.get('bitrate', 8000000)//1000000}Mbps")
 
-        # 创建视频发送器
-        # 传递 V4L2 Loopback 配置用于双进程架构
+        # ============== 方案 B: 使用 LoopbackCapturer 的双输出模式 ==============
+        # 如果 loopback_capturer 正在运行，切换到双输出模式
+        # 这样不需要重新初始化相机，只需切换 FFmpeg 输出模式
+        if self.loopback_capturer and self.loopback_capturer.is_capturing():
+            logger.info("使用 LoopbackCapturer 双输出模式 (相机已被占用)")
+            self._start_video_stream_with_capturer(client, target_ip, target_port, params)
+            return
+
+        # ============== 原有逻辑: 创建新的 SimpleH264Sender ==============
+        # 当没有 loopback_capturer 时使用此路径
         config = VideoConfig(
             width=params.get('width', 2560),
             height=params.get('height', 720),
@@ -832,6 +891,180 @@ class XRoboCompatServer:
             logger.error(f"启动视频流异常: {e}")
             self._send_error(client, f"Exception: {e}")
             self._set_state(StreamingState.IDLE)
+
+    def _start_video_stream_with_capturer(self, client: socket.socket,
+                                          target_ip: str, target_port: int,
+                                          params: dict):
+        """
+        使用 LoopbackCapturer 启动视频流 (方案 B)
+
+        切换 LoopbackCapturer 到双输出模式，获取 H.264 输出并通过 TCP 发送
+        """
+        import subprocess
+        from collections import deque
+
+        try:
+            # 1. 建立 TCP 连接
+            logger.info(f"连接到 {target_ip}:{target_port}...")
+            tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            tcp_socket.settimeout(5.0)
+
+            try:
+                tcp_socket.connect((target_ip, target_port))
+                tcp_socket.settimeout(5.0)
+                logger.info(f"TCP 连接成功: {target_ip}:{target_port}")
+            except Exception as e:
+                logger.error(f"TCP 连接失败: {e}")
+                self._send_error(client, f"TCP connection failed: {e}")
+                self._set_state(StreamingState.IDLE)
+                return
+
+            # 2. 切换 LoopbackCapturer 到双输出模式
+            logger.info("切换 LoopbackCapturer 到双输出模式...")
+            ffmpeg_process = self.loopback_capturer.get_h264_output()
+
+            if not ffmpeg_process:
+                logger.error("无法获取 H.264 输出")
+                tcp_socket.close()
+                self._send_error(client, "Failed to get H.264 output")
+                self._set_state(StreamingState.IDLE)
+                return
+
+            # 3. 标记状态
+            with self._state_lock:
+                self._streaming_state = StreamingState.STREAMING
+
+            logger.info("视频流已启动 (双输出模式)")
+
+            if self.on_streaming_started:
+                self.on_streaming_started(target_ip, target_port)
+
+            # 4. 启动发送线程
+            send_thread = threading.Thread(
+                target=self._capturer_send_loop,
+                args=(ffmpeg_process, tcp_socket),
+                daemon=True
+            )
+            send_thread.start()
+
+        except Exception as e:
+            logger.error(f"启动视频流异常: {e}")
+            self._send_error(client, f"Exception: {e}")
+            self._set_state(StreamingState.IDLE)
+
+    def _capturer_send_loop(self, ffmpeg_process: subprocess.Popen, tcp_socket: socket.socket):
+        """
+        从 LoopbackCapturer 的 FFmpeg 进程读取 H.264 并发送
+
+        与 SimpleH264Sender._send_loop 类似的逻辑
+        """
+        import struct
+        from collections import deque
+
+        BUFFER_READ_SIZE = 32768
+        MAX_BUFFER_SIZE = 512 * 1024
+
+        buffer = b''
+        frame_count = 0
+        last_log_time = time.time()
+        first_sps_found = False
+        start_time = time.time()
+
+        logger.info("开始发送 H.264 数据流 (双输出模式)...")
+
+        try:
+            while self._streaming_state == StreamingState.STREAMING:
+                # 从 FFmpeg 读取数据
+                chunk = ffmpeg_process.stdout.read(BUFFER_READ_SIZE)
+                if not chunk:
+                    if ffmpeg_process.poll() is not None:
+                        logger.info("FFmpeg 进程已结束")
+                        break
+                    time.sleep(0.001)
+                    continue
+
+                buffer += chunk
+
+                # 按 SPS NAL 分割帧
+                while len(buffer) > 5:
+                    if not first_sps_found:
+                        sps_idx = self._find_nal_type(buffer, 7, 0)
+                        if sps_idx < 0:
+                            break
+                        if sps_idx > 0:
+                            buffer = buffer[sps_idx:]
+                        first_sps_found = True
+                        continue
+
+                    next_sps_idx = self._find_nal_type(buffer, 7, 5)
+
+                    if next_sps_idx > 0:
+                        frame_data = buffer[:next_sps_idx]
+                        buffer = buffer[next_sps_idx:]
+
+                        # 发送帧
+                        try:
+                            length_bytes = struct.pack('>I', len(frame_data))
+                            tcp_socket.sendall(length_bytes + frame_data)
+                            frame_count += 1
+                        except Exception as e:
+                            logger.error(f"发送失败: {e}")
+                            break
+
+                        # 每秒输出统计
+                        now = time.time()
+                        if now - last_log_time >= 1.0:
+                            elapsed = now - start_time
+                            fps = frame_count / elapsed if elapsed > 0 else 0
+                            logger.info(f"帧:{frame_count} | {fps:.1f}fps (双输出模式)")
+                            last_log_time = now
+                    else:
+                        if len(buffer) > MAX_BUFFER_SIZE:
+                            logger.warning("缓冲区溢出，丢弃旧数据")
+                            buffer = buffer[-BUFFER_READ_SIZE:]
+                            first_sps_found = False
+                        break
+
+        except Exception as e:
+            logger.error(f"发送循环错误: {e}")
+        finally:
+            # 清理
+            logger.info(f"发送循环结束，共发送 {frame_count} 帧")
+            try:
+                tcp_socket.close()
+            except:
+                pass
+
+            # 回退 LoopbackCapturer 到仅 loopback 模式
+            if self.loopback_capturer:
+                self.loopback_capturer.release_h264_output()
+
+            self._set_state(StreamingState.IDLE)
+
+            if self.on_streaming_stopped:
+                self.on_streaming_stopped()
+
+    def _find_nal_type(self, data: bytes, nal_type: int, start: int = 0) -> int:
+        """查找指定类型的 NAL 单元"""
+        pos = start
+        while pos < len(data) - 4:
+            # 查找 00 00 00 01 startcode
+            if data[pos:pos+4] == b'\x00\x00\x00\x01':
+                if pos + 4 < len(data):
+                    nal_header = data[pos + 4]
+                    if (nal_header & 0x1F) == nal_type:
+                        return pos
+                pos += 4
+            elif data[pos:pos+3] == b'\x00\x00\x01':
+                if pos + 3 < len(data):
+                    nal_header = data[pos + 3]
+                    if (nal_header & 0x1F) == nal_type:
+                        return pos
+                pos += 3
+            else:
+                pos += 1
+        return -1
 
     def _on_video_connection_lost(self, reason: str):
         """
@@ -940,6 +1173,12 @@ class XRoboCompatServer:
         self.is_running = False
 
         self._stop_video_stream_internal()
+
+        # 停止 Loopback 采集器 (方案 B)
+        if self.loopback_capturer:
+            logger.info("停止 Loopback 采集器...")
+            self.loopback_capturer.stop()
+            self.loopback_capturer = None
 
         if self.client_socket:
             try:
