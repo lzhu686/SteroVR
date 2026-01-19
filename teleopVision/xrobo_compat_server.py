@@ -964,25 +964,43 @@ class XRoboCompatServer:
         """
         从 LoopbackCapturer 的 FFmpeg 进程读取 H.264 并发送
 
-        与 SimpleH264Sender._send_loop 类似的逻辑
+        数据流:
+        1. FFmpeg (DUAL_OUTPUT) -> stdout -> H.264 数据
+        2. 解析 NAL 单元，按帧发送
+        3. TCP 发送到 PICO
+
+        断开处理:
+        - TCP 发送失败 -> 退出循环 -> 回退到 LOOPBACK_ONLY
+        - FFmpeg 进程退出 -> 退出循环 -> 回退到 LOOPBACK_ONLY
         """
         import struct
-        from collections import deque
+        import select
 
         BUFFER_READ_SIZE = 32768
         MAX_BUFFER_SIZE = 512 * 1024
+        SEND_TIMEOUT = 5.0  # TCP 发送超时
 
         buffer = b''
         frame_count = 0
         last_log_time = time.time()
         first_sps_found = False
         start_time = time.time()
+        connection_lost = False
 
         logger.info("开始发送 H.264 数据流 (双输出模式)...")
 
+        # 设置 TCP socket 超时
+        tcp_socket.settimeout(SEND_TIMEOUT)
+
         try:
-            while self._streaming_state == StreamingState.STREAMING:
-                # 从 FFmpeg 读取数据
+            while self._streaming_state == StreamingState.STREAMING and not connection_lost:
+                # 从 FFmpeg 读取数据 (使用 select 避免阻塞)
+                import os
+                if hasattr(select, 'select'):
+                    readable, _, _ = select.select([ffmpeg_process.stdout], [], [], 0.1)
+                    if not readable:
+                        continue
+
                 chunk = ffmpeg_process.stdout.read(BUFFER_READ_SIZE)
                 if not chunk:
                     if ffmpeg_process.poll() is not None:
@@ -994,7 +1012,7 @@ class XRoboCompatServer:
                 buffer += chunk
 
                 # 按 SPS NAL 分割帧
-                while len(buffer) > 5:
+                while len(buffer) > 5 and not connection_lost:
                     if not first_sps_found:
                         sps_idx = self._find_nal_type(buffer, 7, 0)
                         if sps_idx < 0:
@@ -1015,8 +1033,17 @@ class XRoboCompatServer:
                             length_bytes = struct.pack('>I', len(frame_data))
                             tcp_socket.sendall(length_bytes + frame_data)
                             frame_count += 1
+                        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+                            logger.warning(f"PICO 连接断开: {e}")
+                            connection_lost = True
+                            break
+                        except socket.timeout:
+                            logger.warning("TCP 发送超时，连接可能断开")
+                            connection_lost = True
+                            break
                         except Exception as e:
                             logger.error(f"发送失败: {e}")
+                            connection_lost = True
                             break
 
                         # 每秒输出统计
@@ -1036,18 +1063,24 @@ class XRoboCompatServer:
         except Exception as e:
             logger.error(f"发送循环错误: {e}")
         finally:
-            # 清理
+            # 清理 TCP 连接
             logger.info(f"发送循环结束，共发送 {frame_count} 帧")
+            try:
+                tcp_socket.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
             try:
                 tcp_socket.close()
             except:
                 pass
 
             # 回退 LoopbackCapturer 到仅 loopback 模式
+            logger.info("回退到 LOOPBACK_ONLY 模式 (ROS2 继续正常工作)")
             if self.loopback_capturer:
                 self.loopback_capturer.release_h264_output()
 
             self._set_state(StreamingState.IDLE)
+            logger.info("资源已清理，等待 PICO 重新连接...")
 
             if self.on_streaming_stopped:
                 self.on_streaming_stopped()

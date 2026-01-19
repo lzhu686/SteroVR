@@ -1236,22 +1236,50 @@ class LoopbackCapturer:
         释放 H.264 输出，回退到仅 loopback 模式
 
         PICO 断开连接时调用
+
+        数据流变化:
+        DUAL_OUTPUT: Camera -> FFmpeg -> [H.264 stdout + MJPEG loopback]
+                                  ↓
+        LOOPBACK_ONLY: Camera -> FFmpeg -> [MJPEG loopback]
+
+        注意: ROS2 发布进程不受影响，继续从 loopback 读取
         """
         with self._mode_lock:
             if not self._h264_enabled:
+                logger.debug("[LoopbackCapturer] 已经是 LOOPBACK_ONLY 模式")
                 return
 
             logger.info("[LoopbackCapturer] 切换回 LOOPBACK_ONLY 模式...")
 
+            # 停止当前的双输出 FFmpeg
             if self.ffmpeg_process:
-                self.ffmpeg_process.terminate()
                 try:
-                    self.ffmpeg_process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    self.ffmpeg_process.kill()
+                    # 先关闭 stdout 让读取线程退出
+                    if self.ffmpeg_process.stdout:
+                        try:
+                            self.ffmpeg_process.stdout.close()
+                        except:
+                            pass
+
+                    self.ffmpeg_process.terminate()
+                    try:
+                        self.ffmpeg_process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        logger.warning("[LoopbackCapturer] FFmpeg 未响应，强制杀死...")
+                        self.ffmpeg_process.kill()
+                        self.ffmpeg_process.wait(timeout=1)
+                except Exception as e:
+                    logger.warning(f"[LoopbackCapturer] 停止 FFmpeg 时出错: {e}")
+                finally:
+                    self.ffmpeg_process = None
 
             self._h264_enabled = False
-            self._start_ffmpeg_loopback_only()
+
+            # 启动仅 loopback 模式
+            if self._start_ffmpeg_loopback_only():
+                logger.info("[LoopbackCapturer] 已切换回 LOOPBACK_ONLY 模式，ROS2 继续正常工作")
+            else:
+                logger.error("[LoopbackCapturer] 启动 LOOPBACK_ONLY 模式失败！")
 
     def _check_nvenc_available(self) -> bool:
         """检测 NVENC"""
