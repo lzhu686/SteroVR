@@ -93,6 +93,8 @@ class ROS2LoopbackPublisher:
         self.node = None
         self.pub_left = None
         self.pub_right = None
+        self.pub_left_raw = None      # Image Raw 发布者
+        self.pub_right_raw = None     # Image Raw 发布者
         self.ros2_available = False
 
         # 统计
@@ -185,14 +187,14 @@ class ROS2LoopbackPublisher:
         """初始化 ROS2 节点和发布者"""
         try:
             import rclpy
-            from sensor_msgs.msg import CompressedImage
+            from sensor_msgs.msg import CompressedImage, Image
 
             if not rclpy.ok():
                 rclpy.init()
 
             self.node = rclpy.create_node('stereo_camera_publisher')
 
-            # 创建发布者 (使用默认 QoS: RELIABLE, depth=10)
+            # 创建 CompressedImage 发布者 (用于网络传输，带宽优化)
             self.pub_left = self.node.create_publisher(
                 CompressedImage,
                 '/stereo/left/compressed',
@@ -204,11 +206,25 @@ class ROS2LoopbackPublisher:
                 10
             )
 
+            # 创建 Image Raw 发布者 (用于本地 RViz2 显示，共享内存传输)
+            self.pub_left_raw = self.node.create_publisher(
+                Image,
+                '/stereo/left/image_raw',
+                10
+            )
+            self.pub_right_raw = self.node.create_publisher(
+                Image,
+                '/stereo/right/image_raw',
+                10
+            )
+
             self.ros2_available = True
             logger.info("ROS2 节点初始化成功")
             logger.info("  发布话题:")
-            logger.info("    - /stereo/left/compressed")
-            logger.info("    - /stereo/right/compressed")
+            logger.info("    - /stereo/left/compressed  (CompressedImage, 网络优化)")
+            logger.info("    - /stereo/right/compressed (CompressedImage, 网络优化)")
+            logger.info("    - /stereo/left/image_raw   (Image, RViz2 本地显示)")
+            logger.info("    - /stereo/right/image_raw  (Image, RViz2 本地显示)")
             return True
 
         except ImportError as e:
@@ -309,7 +325,7 @@ class ROS2LoopbackPublisher:
     def _publish_loop(self):
         """发布循环"""
         import rclpy
-        from sensor_msgs.msg import CompressedImage
+        from sensor_msgs.msg import CompressedImage, Image
         from builtin_interfaces.msg import Time
 
         frame_count = 0
@@ -381,6 +397,31 @@ class ROS2LoopbackPublisher:
                 msg_right.format = 'jpeg'
                 msg_right.data = right_jpeg.tobytes()
                 self.pub_right.publish(msg_right)
+
+                # 发布 Image Raw (用于 RViz2 本地显示，共享内存传输，不占网络带宽)
+                # 左眼 Raw
+                msg_left_raw = Image()
+                msg_left_raw.header.stamp = timestamp
+                msg_left_raw.header.frame_id = 'stereo_left'
+                msg_left_raw.height = left_frame.shape[0]
+                msg_left_raw.width = left_frame.shape[1]
+                msg_left_raw.encoding = 'bgr8'
+                msg_left_raw.is_bigendian = False
+                msg_left_raw.step = left_frame.shape[1] * 3  # width * channels
+                msg_left_raw.data = left_frame.tobytes()
+                self.pub_left_raw.publish(msg_left_raw)
+
+                # 右眼 Raw
+                msg_right_raw = Image()
+                msg_right_raw.header.stamp = timestamp
+                msg_right_raw.header.frame_id = 'stereo_right'
+                msg_right_raw.height = right_frame.shape[0]
+                msg_right_raw.width = right_frame.shape[1]
+                msg_right_raw.encoding = 'bgr8'
+                msg_right_raw.is_bigendian = False
+                msg_right_raw.step = right_frame.shape[1] * 3  # width * channels
+                msg_right_raw.data = right_frame.tobytes()
+                self.pub_right_raw.publish(msg_right_raw)
 
                 frame_count += 1
                 self.stats['frames_published'] = frame_count
