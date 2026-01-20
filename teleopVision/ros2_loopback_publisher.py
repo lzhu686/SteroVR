@@ -337,13 +337,16 @@ class ROS2LoopbackPublisher:
                     time.sleep(0.1)
                     continue
 
-                # YUYV422 转 BGR (原始视频需要颜色空间转换)
-                # YUYV 是打包格式，每两个像素共享 U 和 V 分量
-                if frame.dtype == np.uint8 and frame.shape[1] * 2 == w:
-                    # 确实是 YUYV422 格式，需要转换
-                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_YUV422BGR)
+                # 颜色空间转换 (如果需要)
+                # OpenCV 通常自动将 YUYV422 转为 BGR，但需要检查通道数
+                if len(frame.shape) == 2:
+                    # 灰度图，转为 BGR
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                elif frame.shape[2] == 2:
+                    # YUYV422 格式 (每像素 2 字节)，转为 BGR
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YUYV)
                 else:
-                    # 已经是 BGR 格式或未知格式，直接使用
+                    # 已经是 BGR 格式 (3 通道)
                     frame_bgr = frame
 
                 # 分割左右眼
@@ -374,9 +377,6 @@ class ROS2LoopbackPublisher:
                 msg_right.data = right_jpeg.tobytes()
                 self.pub_right.publish(msg_right)
 
-                # 处理 ROS2 回调 (必须调用以确保消息发送)
-                rclpy.spin_once(self.node, timeout_sec=0)
-
                 frame_count += 1
                 self.stats['frames_published'] = frame_count
 
@@ -390,7 +390,7 @@ class ROS2LoopbackPublisher:
                                f"跳过: {skipped}")
                     last_log_time = now
 
-                # 处理 ROS2 回调
+                # 处理 ROS2 回调 (确保消息发送)
                 rclpy.spin_once(self.node, timeout_sec=0)
 
             except KeyboardInterrupt:
