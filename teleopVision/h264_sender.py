@@ -1050,14 +1050,14 @@ class LoopbackCapturer:
             '-i', self.device_path,
         ]
 
-        # 输出 rawvideo 到 loopback (帧边界清晰，无压缩问题)
+        # 输出到 v4l2loopback (使用 v4l2 格式让设备正确识别像素格式)
+        # 关键: -f v4l2 而不是 -f rawvideo，否则 loopback 设备无法识别像素格式
         ffmpeg_cmd = [
             'ffmpeg', '-y'
         ] + input_args + [
             '-r', str(loopback_fps),           # 降帧率
-            '-f', 'rawvideo',                  # 原始视频格式
-            '-pix_fmt', 'yuyv422',             # YUY2 像素格式 (v4l2loopback 常用)
-            '-s', f'{width}x{height}',         # 显式指定尺寸
+            '-f', 'v4l2',                      # V4L2 输出格式 (让设备正确识别)
+            '-pix_fmt', 'yuyv422',             # YUY2 像素格式
             loopback_device
         ]
 
@@ -1219,12 +1219,11 @@ class LoopbackCapturer:
         ] + encoder_args + [
             '-f', 'h264', 'pipe:1',
 
-            # 输出 2: Raw Video 到 loopback (ROS2) - 零丢帧
+            # 输出 2: V4L2 到 loopback (ROS2) - 使用 v4l2 格式让设备正确识别
             '-map', '0:v',
             '-r', str(loopback_fps),
-            '-f', 'rawvideo',
+            '-f', 'v4l2',
             '-pix_fmt', 'yuyv422',
-            '-s', f'{width}x{height}',
             loopback_device
         ]
 
