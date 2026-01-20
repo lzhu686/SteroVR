@@ -1031,10 +1031,15 @@ class LoopbackCapturer:
         """
         启动 FFmpeg (仅 loopback 输出)
 
-        使用 Raw Video 格式替代 MJPEG，彻底解决帧边界问题：
-        - Raw video 无压缩，帧边界清晰
-        - 零丢帧，数据完整性 100%
-        - 带宽增加但在内核内存中传输，无影响
+        使用 BGR24 格式替代 YUYV422，彻底解决格式协商问题：
+        - BGR24 是 OpenCV 原生格式，读取后直接可用，无需颜色转换
+        - 固定帧大小 (width × height × 3)，帧边界 100% 清晰
+        - 比 YUYV422 大 50%，但在内核内存中传输，无影响
+
+        为什么用 BGR24 而不是 YUYV422？
+        - YUYV422 需要 OpenCV 做 cv2.COLOR_YUV2BGR_YUYV 转换
+        - BGR24 直接就是 numpy array (H, W, 3)，零转换开销
+        - BGR24 在 v4l2loopback 上兼容性更好
         """
         loopback_device = self.config.loopback_device
         loopback_fps = self.config.loopback_fps
@@ -1050,21 +1055,21 @@ class LoopbackCapturer:
             '-i', self.device_path,
         ]
 
-        # 输出到 v4l2loopback (使用 v4l2 格式让设备正确识别像素格式)
-        # 关键: -f v4l2 而不是 -f rawvideo，否则 loopback 设备无法识别像素格式
+        # 输出到 v4l2loopback (使用 BGR24 格式，OpenCV 原生格式)
+        # 关键: -f v4l2 让设备正确识别，-pix_fmt bgr24 是 OpenCV 原生格式
         ffmpeg_cmd = [
             'ffmpeg', '-y'
         ] + input_args + [
             '-r', str(loopback_fps),           # 降帧率
             '-f', 'v4l2',                      # V4L2 输出格式 (让设备正确识别)
-            '-pix_fmt', 'yuyv422',             # YUY2 像素格式
+            '-pix_fmt', 'bgr24',               # BGR24: OpenCV 原生格式，零转换
             loopback_device
         ]
 
         try:
-            logger.info(f"[LoopbackCapturer] 启动 FFmpeg (LOOPBACK_ONLY 模式 - Raw Video)")
-            logger.info(f"[LoopbackCapturer] 输出: {loopback_device} @ {loopback_fps}fps (YUYV422 原始格式)")
-            logger.info(f"[LoopbackCapturer] 带宽: {width}x{height}×{loopback_fps}×2 = {width*height*loopback_fps*2/1024/1024:.1f} MB/s")
+            logger.info(f"[LoopbackCapturer] 启动 FFmpeg (LOOPBACK_ONLY 模式 - BGR24)")
+            logger.info(f"[LoopbackCapturer] 输出: {loopback_device} @ {loopback_fps}fps (BGR24 原始格式)")
+            logger.info(f"[LoopbackCapturer] 带宽: {width}x{height}×{loopback_fps}×3 = {width*height*loopback_fps*3/1024/1024:.1f} MB/s")
             logger.info(f"[LoopbackCapturer] 命令: {' '.join(ffmpeg_cmd)}")
 
             self.ffmpeg_process = subprocess.Popen(
@@ -1189,7 +1194,7 @@ class LoopbackCapturer:
         启动 FFmpeg (双输出模式)
 
         输出 1: H.264 → stdout (PICO) - 硬件编码
-        输出 2: Raw Video → loopback (ROS2) - 无压缩，帧边界清晰
+        输出 2: BGR24 → loopback (ROS2) - OpenCV 原生格式，零转换
         """
         loopback_device = self.config.loopback_device
         loopback_fps = self.config.loopback_fps
@@ -1219,19 +1224,19 @@ class LoopbackCapturer:
         ] + encoder_args + [
             '-f', 'h264', 'pipe:1',
 
-            # 输出 2: V4L2 到 loopback (ROS2) - 使用 v4l2 格式让设备正确识别
+            # 输出 2: BGR24 到 loopback (ROS2) - OpenCV 原生格式
             '-map', '0:v',
             '-r', str(loopback_fps),
             '-f', 'v4l2',
-            '-pix_fmt', 'yuyv422',
+            '-pix_fmt', 'bgr24',
             loopback_device
         ]
 
         try:
-            logger.info(f"[LoopbackCapturer] 启动 FFmpeg (DUAL_OUTPUT 模式 - Raw Video)")
+            logger.info(f"[LoopbackCapturer] 启动 FFmpeg (DUAL_OUTPUT 模式 - BGR24)")
             logger.info(f"[LoopbackCapturer] 主输出: H.264 → stdout ({actual_fps}fps, {bitrate_k}kbps)")
-            logger.info(f"[LoopbackCapturer] 副输出: Raw Video → {loopback_device} ({loopback_fps}fps, YUYV422)")
-            logger.info(f"[LoopbackCapturer] 带宽: {width}x{height}×{loopback_fps}×2 = {width*height*loopback_fps*2/1024/1024:.1f} MB/s")
+            logger.info(f"[LoopbackCapturer] 副输出: BGR24 → {loopback_device} ({loopback_fps}fps)")
+            logger.info(f"[LoopbackCapturer] 带宽: {width}x{height}×{loopback_fps}×3 = {width*height*loopback_fps*3/1024/1024:.1f} MB/s")
 
             self.ffmpeg_process = subprocess.Popen(
                 ffmpeg_cmd,

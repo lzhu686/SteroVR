@@ -220,9 +220,9 @@ class ROS2LoopbackPublisher:
             return False
 
     def _open_loopback(self) -> bool:
-        """打开 V4L2 Loopback 设备 (支持 Raw Video YUYV422 格式)"""
+        """打开 V4L2 Loopback 设备 (BGR24 格式，OpenCV 原生格式)"""
         logger.info(f"正在打开 V4L2 Loopback 设备: {self.loopback_device}")
-        logger.info("注意: 使用 Raw Video (YUYV422) 格式，无 MJPEG 帧边界问题")
+        logger.info("注意: 使用 BGR24 格式，OpenCV 原生格式，零转换开销")
 
         # 等待设备可用 (主进程可能还没开始输出)
         max_retries = 30
@@ -249,14 +249,19 @@ class ROS2LoopbackPublisher:
                 self.cap = cv2.VideoCapture(device_num, cv2.CAP_V4L2)
 
                 if self.cap.isOpened():
-                    # 设置像素格式为 YUYV422 (v4l2loopback raw video 格式)
-                    self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('Y', 'U', 'Y', 'V'))
-
+                    # 尝试读取一帧来确认设备可用
                     ret, frame = self.cap.read()
                     if ret and frame is not None:
                         h, w = frame.shape[:2]
-                        logger.info(f"V4L2 Loopback 设备已打开: {w}x{h} (YUYV422)")
-                        logger.info(f"数据格式: {frame.dtype}, 每像素 2 bytes")
+                        channels = frame.shape[2] if len(frame.shape) == 3 else 1
+                        logger.info(f"V4L2 Loopback 设备已打开: {w}x{h}x{channels}")
+
+                        # BGR24 格式应该是 3 通道
+                        if channels == 3:
+                            logger.info(f"数据格式: BGR24 (OpenCV 原生格式)，dtype={frame.dtype}")
+                        else:
+                            logger.warning(f"意外的通道数: {channels}，期望 3 (BGR24)")
+
                         return True
 
                     # 释放并重试
@@ -337,17 +342,17 @@ class ROS2LoopbackPublisher:
                     time.sleep(0.1)
                     continue
 
-                # 颜色空间转换 (如果需要)
-                # OpenCV 通常自动将 YUYV422 转为 BGR，但需要检查通道数
-                if len(frame.shape) == 2:
-                    # 灰度图，转为 BGR
+                # BGR24 格式：OpenCV 直接读取为 3 通道 BGR，无需颜色转换
+                if len(frame.shape) == 3 and frame.shape[2] == 3:
+                    frame_bgr = frame  # 已经是 BGR，直接使用
+                elif len(frame.shape) == 2:
+                    # 灰度图 (不应该发生)
+                    logger.warning("收到灰度图，转换为 BGR")
                     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                elif frame.shape[2] == 2:
-                    # YUYV422 格式 (每像素 2 字节)，转为 BGR
-                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YUYV)
                 else:
-                    # 已经是 BGR 格式 (3 通道)
-                    frame_bgr = frame
+                    logger.warning(f"意外的帧格式: shape={frame.shape}，跳过")
+                    self.stats['frames_skipped'] += 1
+                    continue
 
                 # 分割左右眼
                 left_frame = frame_bgr[:, :half_w]
