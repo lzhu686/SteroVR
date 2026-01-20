@@ -43,6 +43,7 @@ ROS2 独立发布进程 - 从 V4L2 Loopback 虚拟相机读取并发布
 """
 
 import cv2
+import numpy as np
 import time
 import argparse
 import logging
@@ -63,6 +64,10 @@ class ROS2LoopbackPublisher:
 
     独立进程运行，不影响主视频流
     """
+
+    # JPEG 标记
+    JPEG_START = b'\xff\xd8'  # JPEG SOI (Start Of Image)
+    JPEG_END = b'\xff\xd9'    # JPEG EOI (End Of Image)
 
     def __init__(self,
                  loopback_device: str = "/dev/video99",
@@ -93,9 +98,88 @@ class ROS2LoopbackPublisher:
         # 统计
         self.stats = {
             'frames_published': 0,
+            'frames_skipped': 0,  # 跳过的损坏帧数
             'start_time': 0.0,
             'last_frame_time': 0.0,
         }
+
+    @staticmethod
+    def _is_valid_jpeg(data: bytes) -> bool:
+        """
+        检查数据是否为有效的 JPEG 格式
+
+        验证:
+        1. 以 JPEG SOI 标记 (0xFF 0xD8) 开头
+        2. 以 JPEG EOI 标记 (0xFF 0xD9) 结尾
+        3. 数据长度合理
+        """
+        if data is None or len(data) < 2:
+            return False
+
+        # 检查起始标记
+        if not data.startswith(ROS2LoopbackPublisher.JPEG_START):
+            return False
+
+        # 检查结束标记
+        if not data.endswith(ROS2LoopbackPublisher.JPEG_END):
+            return False
+
+        # 数据长度检查 (最小有效 JPEG 约 100 bytes)
+        if len(data) < 100:
+            return False
+
+        return True
+
+    @staticmethod
+    def _fix_jpeg_frame(data: bytes) -> Optional[bytes]:
+        """
+        尝试修复损坏的 JPEG 帧
+
+        从数据中提取完整的 JPEG:
+        1. 找到所有有效的 JPEG 帧
+        2. 返回包含起始和结束标记的完整帧
+        """
+        if data is None or len(data) < 2:
+            return None
+
+        # 如果数据以 JPEG 开头但没有结束标记，尝试修复
+        if data.startswith(ROS2LoopbackPublisher.JPEG_START):
+            # 查找结束标记
+            end_pos = data.rfind(ROS2LoopbackPublisher.JPEG_END)
+            if end_pos >= 0:
+                # 返回完整的帧（包括结束标记）
+                return data[:end_pos + 2]
+
+            # 如果没有找到结束标记，添加它
+            return data + ROS2LoopbackPublisher.JPEG_END
+
+        return None
+
+    def _read_frame_with_retry(self, max_retries: int = 3) -> Optional[cv2.Mat]:
+        """
+        带重试机制的帧读取
+
+        读取帧并验证 JPEG 完整性，如果损坏则重试
+        """
+        for attempt in range(max_retries):
+            ret, frame = self.cap.read()
+            if not ret or frame is None:
+                time.sleep(0.01 * (attempt + 1))
+                continue
+
+            h, w = frame.shape[:2] if len(frame.shape) == 2 else frame.shape[:2]
+
+            # 检查图像尺寸是否有效
+            if w < 100 or h < 100:
+                self.stats['frames_skipped'] += 1
+                logger.debug(f"跳过异常尺寸帧: {w}x{h}")
+                time.sleep(0.01 * (attempt + 1))
+                continue
+
+            return frame
+
+        self.stats['frames_skipped'] += max_retries
+        return None
 
     def _init_ros2(self) -> bool:
         """初始化 ROS2 节点和发布者"""
@@ -145,8 +229,9 @@ class ROS2LoopbackPublisher:
             return False
 
     def _open_loopback(self) -> bool:
-        """打开 V4L2 Loopback 设备"""
+        """打开 V4L2 Loopback 设备 (支持 Raw Video YUYV422 格式)"""
         logger.info(f"正在打开 V4L2 Loopback 设备: {self.loopback_device}")
+        logger.info("注意: 使用 Raw Video (YUYV422) 格式，无 MJPEG 帧边界问题")
 
         # 等待设备可用 (主进程可能还没开始输出)
         max_retries = 30
@@ -168,16 +253,25 @@ class ROS2LoopbackPublisher:
                     else:
                         # 尝试作为索引打开
                         device_num = int(self.loopback_device)
-                # 验证设备是否可打开
-                test_cap = cv2.VideoCapture(device_num)
-                if test_cap.isOpened():
-                    ret, frame = test_cap.read()
-                    test_cap.release()
+
+                # 使用 V4L2 后端打开
+                self.cap = cv2.VideoCapture(device_num, cv2.CAP_V4L2)
+
+                if self.cap.isOpened():
+                    # 设置像素格式为 YUYV422 (v4l2loopback raw video 格式)
+                    self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('Y', 'U', 'Y', 'V'))
+
+                    ret, frame = self.cap.read()
                     if ret and frame is not None:
                         h, w = frame.shape[:2]
-                        self.cap = cv2.VideoCapture(device_num)
-                        logger.info(f"V4L2 Loopback 设备已打开: {w}x{h}")
+                        logger.info(f"V4L2 Loopback 设备已打开: {w}x{h} (YUYV422)")
+                        logger.info(f"数据格式: {frame.dtype}, 每像素 2 bytes")
                         return True
+
+                    # 释放并重试
+                    self.cap.release()
+                    self.cap = None
+
                 logger.debug(f"设备已打开但无数据 (尝试 {attempt+1}/{max_retries})")
 
             except Exception as e:
@@ -236,11 +330,10 @@ class ROS2LoopbackPublisher:
                     now = time.time()
                 last_frame_time = now
 
-                # 读取帧
-                ret, frame = self.cap.read()
-                if not ret or frame is None:
-                    logger.warning("读取帧失败，等待数据...")
-                    time.sleep(0.1)
+                # 使用带重试的帧读取
+                frame = self._read_frame_with_retry(max_retries=3)
+                if frame is None:
+                    logger.debug("无法读取有效帧，继续等待...")
                     continue
 
                 h, w = frame.shape[:2]
@@ -248,13 +341,23 @@ class ROS2LoopbackPublisher:
 
                 # 检查是否是有效的双目图像
                 if half_w < 100:
+                    self.stats['frames_skipped'] += 1
                     logger.warning(f"图像宽度异常: {w}，可能不是双目图像")
                     time.sleep(0.1)
                     continue
 
+                # YUYV422 转 BGR (原始视频需要颜色空间转换)
+                # YUYV 是打包格式，每两个像素共享 U 和 V 分量
+                if frame.dtype == np.uint8 and frame.shape[1] * 2 == w:
+                    # 确实是 YUYV422 格式，需要转换
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_YUV422BGR)
+                else:
+                    # 已经是 BGR 格式或未知格式，直接使用
+                    frame_bgr = frame
+
                 # 分割左右眼
-                left_frame = frame[:, :half_w]
-                right_frame = frame[:, half_w:]
+                left_frame = frame_bgr[:, :half_w]
+                right_frame = frame_bgr[:, half_w:]
 
                 # 编码为 JPEG
                 encode_params = [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
@@ -290,8 +393,10 @@ class ROS2LoopbackPublisher:
                 if now - last_log_time >= 1.0:
                     elapsed_total = now - self.stats['start_time']
                     fps = frame_count / elapsed_total if elapsed_total > 0 else 0
+                    skipped = self.stats['frames_skipped']
                     logger.info(f"已发布: {frame_count} 帧 | {fps:.1f} fps | "
-                               f"左眼: {len(left_jpeg)} bytes, 右眼: {len(right_jpeg)} bytes")
+                               f"左眼: {len(left_jpeg)} bytes, 右眼: {len(right_jpeg)} bytes | "
+                               f"跳过: {skipped}")
                     last_log_time = now
 
                 # 处理 ROS2 回调
@@ -330,13 +435,20 @@ class ROS2LoopbackPublisher:
 
         # 输出统计
         elapsed = time.time() - self.stats['start_time'] if self.stats['start_time'] > 0 else 0
+        skipped = self.stats['frames_skipped']
+        published = self.stats['frames_published']
+        total = published + skipped
+        valid_rate = (published / total * 100) if total > 0 else 0
+
         logger.info("=" * 60)
         logger.info("ROS2 Loopback Publisher 统计")
         logger.info("=" * 60)
         logger.info(f"  运行时长: {elapsed:.1f} 秒")
-        logger.info(f"  发布帧数: {self.stats['frames_published']}")
+        logger.info(f"  发布帧数: {published}")
+        logger.info(f"  跳过帧数: {skipped}")
+        logger.info(f"  有效率: {valid_rate:.1f}%")
         if elapsed > 0:
-            logger.info(f"  平均帧率: {self.stats['frames_published'] / elapsed:.1f} fps")
+            logger.info(f"  平均帧率: {published / elapsed:.1f} fps")
         logger.info("=" * 60)
 
 
