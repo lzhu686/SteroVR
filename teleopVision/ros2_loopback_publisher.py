@@ -185,8 +185,6 @@ class ROS2LoopbackPublisher:
         """初始化 ROS2 节点和发布者"""
         try:
             import rclpy
-            from rclpy.node import Node
-            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
             from sensor_msgs.msg import CompressedImage
 
             if not rclpy.ok():
@@ -194,23 +192,16 @@ class ROS2LoopbackPublisher:
 
             self.node = rclpy.create_node('stereo_camera_publisher')
 
-            # 使用传感器数据 QoS (BEST_EFFORT, 减少延迟)
-            sensor_qos = QoSProfile(
-                reliability=ReliabilityPolicy.BEST_EFFORT,
-                history=HistoryPolicy.KEEP_LAST,
-                depth=1
-            )
-
-            # 创建发布者
+            # 创建发布者 (使用默认 QoS: RELIABLE, depth=10)
             self.pub_left = self.node.create_publisher(
                 CompressedImage,
                 '/stereo/left/compressed',
-                sensor_qos
+                10
             )
             self.pub_right = self.node.create_publisher(
                 CompressedImage,
                 '/stereo/right/compressed',
-                sensor_qos
+                10
             )
 
             self.ros2_available = True
