@@ -93,8 +93,10 @@ class ROS2LoopbackPublisher:
         self.node = None
         self.pub_left = None
         self.pub_right = None
-        self.pub_left_raw = None      # Image Raw 发布者
-        self.pub_right_raw = None     # Image Raw 发布者
+        self.pub_left_raw = None      # Image Raw 发布者 (BGR8)
+        self.pub_right_raw = None     # Image Raw 发布者 (BGR8)
+        self.pub_left_rgb = None      # Image RGB 发布者 (RGB8)
+        self.pub_right_rgb = None     # Image RGB 发布者 (RGB8)
         self.ros2_available = False
 
         # 统计
@@ -206,7 +208,7 @@ class ROS2LoopbackPublisher:
                 10
             )
 
-            # 创建 Image Raw 发布者 (用于本地 RViz2 显示，共享内存传输)
+            # 创建 Image Raw 发布者 (BGR8, 用于本地 RViz2 显示，OpenCV 原生格式)
             self.pub_left_raw = self.node.create_publisher(
                 Image,
                 '/stereo/left/image_raw',
@@ -218,13 +220,27 @@ class ROS2LoopbackPublisher:
                 10
             )
 
+            # 创建 RGB8 发布者 (用于深度学习框架，如 PyTorch/TensorFlow)
+            self.pub_left_rgb = self.node.create_publisher(
+                Image,
+                '/stereo/left/image_rgb',
+                10
+            )
+            self.pub_right_rgb = self.node.create_publisher(
+                Image,
+                '/stereo/right/image_rgb',
+                10
+            )
+
             self.ros2_available = True
             logger.info("ROS2 节点初始化成功")
             logger.info("  发布话题:")
-            logger.info("    - /stereo/left/compressed  (CompressedImage, 网络优化)")
-            logger.info("    - /stereo/right/compressed (CompressedImage, 网络优化)")
-            logger.info("    - /stereo/left/image_raw   (Image, RViz2 本地显示)")
-            logger.info("    - /stereo/right/image_raw  (Image, RViz2 本地显示)")
+            logger.info("    - /stereo/left/compressed  (CompressedImage, JPEG, 网络优化)")
+            logger.info("    - /stereo/right/compressed (CompressedImage, JPEG, 网络优化)")
+            logger.info("    - /stereo/left/image_raw   (Image, BGR8, OpenCV/RViz2)")
+            logger.info("    - /stereo/right/image_raw  (Image, BGR8, OpenCV/RViz2)")
+            logger.info("    - /stereo/left/image_rgb   (Image, RGB8, 深度学习框架)")
+            logger.info("    - /stereo/right/image_rgb  (Image, RGB8, 深度学习框架)")
             return True
 
         except ImportError as e:
@@ -423,6 +439,36 @@ class ROS2LoopbackPublisher:
                 msg_right_raw.data = right_frame.tobytes()
                 self.pub_right_raw.publish(msg_right_raw)
 
+                # 可选: 发布 RGB8 格式 (用于深度学习框架)
+                if self.pub_left_rgb and self.pub_right_rgb:
+                    # BGR → RGB 转换
+                    left_rgb = cv2.cvtColor(left_frame, cv2.COLOR_BGR2RGB)
+                    right_rgb = cv2.cvtColor(right_frame, cv2.COLOR_BGR2RGB)
+
+                    # 左眼 RGB
+                    msg_left_rgb = Image()
+                    msg_left_rgb.header.stamp = timestamp
+                    msg_left_rgb.header.frame_id = 'stereo_left'
+                    msg_left_rgb.height = left_rgb.shape[0]
+                    msg_left_rgb.width = left_rgb.shape[1]
+                    msg_left_rgb.encoding = 'rgb8'
+                    msg_left_rgb.is_bigendian = False
+                    msg_left_rgb.step = left_rgb.shape[1] * 3
+                    msg_left_rgb.data = left_rgb.tobytes()
+                    self.pub_left_rgb.publish(msg_left_rgb)
+
+                    # 右眼 RGB
+                    msg_right_rgb = Image()
+                    msg_right_rgb.header.stamp = timestamp
+                    msg_right_rgb.header.frame_id = 'stereo_right'
+                    msg_right_rgb.height = right_rgb.shape[0]
+                    msg_right_rgb.width = right_rgb.shape[1]
+                    msg_right_rgb.encoding = 'rgb8'
+                    msg_right_rgb.is_bigendian = False
+                    msg_right_rgb.step = right_rgb.shape[1] * 3
+                    msg_right_rgb.data = right_rgb.tobytes()
+                    self.pub_right_rgb.publish(msg_right_rgb)
+
                 frame_count += 1
                 self.stats['frames_published'] = frame_count
 
@@ -500,6 +546,19 @@ def main():
 
   # 指定设备和参数
   python -m teleopVision.ros2_loopback_publisher --device /dev/video99 --fps 30 --quality 85
+
+发布的话题 (共 6 个):
+  CompressedImage (JPEG, 网络传输优化):
+    /stereo/left/compressed
+    /stereo/right/compressed
+
+  Image BGR8 (OpenCV 原生格式, RViz2):
+    /stereo/left/image_raw
+    /stereo/right/image_raw
+
+  Image RGB8 (深度学习框架, PyTorch/TensorFlow):
+    /stereo/left/image_rgb
+    /stereo/right/image_rgb
 
 前置条件:
   1. v4l2loopback 模块已加载:
