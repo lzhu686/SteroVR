@@ -189,6 +189,7 @@ class ROS2LoopbackPublisher:
         """初始化 ROS2 节点和发布者"""
         try:
             import rclpy
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
             from sensor_msgs.msg import CompressedImage, Image
 
             if not rclpy.ok():
@@ -196,44 +197,57 @@ class ROS2LoopbackPublisher:
 
             self.node = rclpy.create_node('stereo_camera_publisher')
 
+            # 图像数据 QoS Profile - 使用 BEST_EFFORT 实现低延迟传输
+            # 原理:
+            #   RELIABLE: 丢包时重传，保证送达，但增加延迟 (适合小数据/关键数据)
+            #   BEST_EFFORT: 不重传，允许丢帧，低延迟 (适合实时视频流)
+            # 对于 30fps 视频流，丢 1 帧 (33ms) 比等待重传 (可能 >100ms) 更好
+            image_qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,  # 不重传，低延迟
+                durability=DurabilityPolicy.VOLATILE,        # 不保存历史消息
+                history=HistoryPolicy.KEEP_LAST,             # 只保留最新
+                depth=1                                      # 队列深度为 1，防止积压
+            )
+
             # 创建 CompressedImage 发布者 (用于网络传输，带宽优化)
             self.pub_left = self.node.create_publisher(
                 CompressedImage,
                 '/stereo/left/compressed',
-                10
+                image_qos
             )
             self.pub_right = self.node.create_publisher(
                 CompressedImage,
                 '/stereo/right/compressed',
-                10
+                image_qos
             )
 
             # 创建 Image Raw 发布者 (BGR8, 用于本地 RViz2 显示，OpenCV 原生格式)
             self.pub_left_raw = self.node.create_publisher(
                 Image,
                 '/stereo/left/image_raw',
-                10
+                image_qos
             )
             self.pub_right_raw = self.node.create_publisher(
                 Image,
                 '/stereo/right/image_raw',
-                10
+                image_qos
             )
 
             # 创建 RGB8 发布者 (用于深度学习框架，如 PyTorch/TensorFlow)
             self.pub_left_rgb = self.node.create_publisher(
                 Image,
                 '/stereo/left/image_rgb',
-                10
+                image_qos
             )
             self.pub_right_rgb = self.node.create_publisher(
                 Image,
                 '/stereo/right/image_rgb',
-                10
+                image_qos
             )
 
             self.ros2_available = True
             logger.info("ROS2 节点初始化成功")
+            logger.info("  QoS Profile: BEST_EFFORT (低延迟，允许丢帧)")
             logger.info("  发布话题:")
             logger.info("    - /stereo/left/compressed  (CompressedImage, JPEG, 网络优化)")
             logger.info("    - /stereo/right/compressed (CompressedImage, JPEG, 网络优化)")
