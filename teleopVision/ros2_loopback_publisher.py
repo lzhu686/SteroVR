@@ -8,12 +8,12 @@ ROS2 独立发布进程 - 从 V4L2 Loopback 虚拟相机读取并发布
 │  进程 1: PICO 视频流 (h264_sender.py)                            │
 │  /dev/stereo_camera → FFmpeg → H.264 → PICO (60fps)          │
 │              ↓                                                   │
-│         MJPEG → /dev/video99 (30fps)                            │
+│         BGR24 → /dev/video99 (30fps)                            │
 └─────────────────────────────────────────────────────────────────┘
                       ↓
 ┌─────────────────────────────────────────────────────────────────┐
 │  进程 2: ROS2 发布 (本脚本)                                       │
-│  /dev/video99 → OpenCV → Split → CompressedImage              │
+│  /dev/video99 → OpenCV (BGR24) → JPEG → CompressedImage        │
 │                                   ├─ /stereo/left/compressed    │
 │                                   └─ /stereo/right/compressed   │
 └─────────────────────────────────────────────────────────────────┘
@@ -186,7 +186,7 @@ class ROS2LoopbackPublisher:
         try:
             import rclpy
             from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-            from sensor_msgs.msg import CompressedImage, Image
+            from sensor_msgs.msg import CompressedImage
 
             if not rclpy.ok():
                 rclpy.init()
@@ -323,7 +323,7 @@ class ROS2LoopbackPublisher:
     def _publish_loop(self):
         """发布循环"""
         import rclpy
-        from sensor_msgs.msg import CompressedImage, Image
+        from sensor_msgs.msg import CompressedImage
         from builtin_interfaces.msg import Time
 
         frame_count = 0
